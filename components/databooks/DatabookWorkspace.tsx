@@ -13,7 +13,6 @@ import { formatDate, truncate } from '@/lib/utils';
 import {
   STATUS_OPTIONS,
   PRIORITY_OPTIONS,
-  FISCAL_YEAR_OPTIONS,
   MONTH_OPTIONS,
 } from '@/lib/constants';
 import {
@@ -77,7 +76,6 @@ export function DatabookWorkspace({
   const [searchVal, setSearchVal] = useState(searchParams.search ?? '');
   const [statusVal, setStatusVal] = useState(searchParams.general_status ?? '');
   const [priorityVal, setPriorityVal] = useState(searchParams.priority ?? '');
-  const [fyVal, setFyVal] = useState(searchParams.fiscal_year ?? '');
   const [respVal, setRespVal] = useState(searchParams.responsible_name ?? '');
   const [monthVal, setMonthVal] = useState(searchParams.month ?? '');
   const [yearVal, setYearVal] = useState(searchParams.year ?? '');
@@ -206,7 +204,6 @@ interface ImportPreviewData {
     setSearchVal(searchParams.search ?? '');
     setStatusVal(searchParams.general_status ?? '');
     setPriorityVal(searchParams.priority ?? '');
-    setFyVal(searchParams.fiscal_year ?? '');
     setRespVal(searchParams.responsible_name ?? '');
     setMonthVal(searchParams.month ?? '');
     setYearVal(searchParams.year ?? '');
@@ -240,7 +237,6 @@ interface ImportPreviewData {
       search: searchVal,
       general_status: statusVal,
       priority: priorityVal,
-      fiscal_year: fyVal,
       responsible_name: respVal,
       month: monthVal,
       year: yearVal,
@@ -251,7 +247,6 @@ interface ImportPreviewData {
     setSearchVal('');
     setStatusVal('');
     setPriorityVal('');
-    setFyVal('');
     setRespVal('');
     setMonthVal('');
     setYearVal('');
@@ -442,19 +437,6 @@ interface ImportPreviewData {
 
         <select
           className="form-control"
-          style={{ width: 'auto', minWidth: 90, height: '28px', padding: '0 0.5rem', fontSize: '0.75rem' }}
-          value={fyVal}
-          onChange={(e) => { setFyVal(e.target.value); updateUrl({ fiscal_year: e.target.value }); }}
-          aria-label="Filtrar por FY"
-        >
-          <option value="">FY: Todos</option>
-          {FISCAL_YEAR_OPTIONS.map((fy) => (
-            <option key={fy} value={fy}>{fy}</option>
-          ))}
-        </select>
-
-        <select
-          className="form-control"
           style={{ width: 'auto', minWidth: 120, height: '28px', padding: '0 0.5rem', fontSize: '0.75rem' }}
           value={respVal}
           onChange={(e) => { setRespVal(e.target.value); updateUrl({ responsible_name: e.target.value }); }}
@@ -492,7 +474,7 @@ interface ImportPreviewData {
           ))}
         </select>
 
-        {(searchVal || statusVal || priorityVal || fyVal || respVal || monthVal || yearVal) && (
+        {(searchVal || statusVal || priorityVal || respVal || monthVal || yearVal) && (
           <button
             onClick={handleClearFilters}
             style={{

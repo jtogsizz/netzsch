@@ -16,7 +16,6 @@ export async function GET(request: Request) {
   const search = searchParams.get('search') ?? '';
   const general_status = searchParams.get('general_status') ?? '';
   const priority = searchParams.get('priority') ?? '';
-  const fiscal_year = searchParams.get('fiscal_year') ?? '';
   const responsible_name = searchParams.get('responsible_name') ?? '';
   const client_name = searchParams.get('client_name') ?? '';
   const month = searchParams.get('month') ?? '';
@@ -37,7 +36,6 @@ export async function GET(request: Request) {
   }
   if (general_status) query = query.eq('general_status', general_status);
   if (priority) query = query.eq('priority', priority);
-  if (fiscal_year) query = query.eq('fiscal_year', fiscal_year);
   if (responsible_name) query = query.ilike('responsible_name', `%${responsible_name}%`);
   if (client_name) query = query.ilike('client_name', `%${client_name}%`);
 
@@ -50,6 +48,8 @@ export async function GET(request: Request) {
     query = query.gte('entry_date', dateFrom).lt('entry_date', nextMonth);
   } else if (year) {
     query = query.gte('entry_date', `${year}-01-01`).lt('entry_date', `${parseInt(year) + 1}-01-01`);
+  } else if (month) {
+    query = query.filter('entry_date::text', 'like', `????-${month}-??`);
   }
 
   // Ordenação e paginação

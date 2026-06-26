@@ -169,6 +169,43 @@ export class MockQueryBuilder {
     return this;
   }
 
+  filter(column: string, operator: string, value: any) {
+    const colName = column.split('::')[0];
+    if (operator === 'like' || operator === 'ilike') {
+      const isCaseInsensitive = operator === 'ilike';
+      const valStr = String(value ?? '');
+      let regexPattern = '';
+      for (let i = 0; i < valStr.length; i++) {
+        const char = valStr[i];
+        if (char === '*') {
+          regexPattern += '.*';
+        } else if (char === '?') {
+          regexPattern += '.';
+        } else if ('[\\^$.|?*+()'.includes(char)) {
+          regexPattern += '\\' + char;
+        } else {
+          regexPattern += char;
+        }
+      }
+      const regex = new RegExp(`^${regexPattern}$`, isCaseInsensitive ? 'i' : '');
+      this.filters.push((item) => {
+        const itemVal = item[colName] === null || item[colName] === undefined ? '' : String(item[colName]);
+        return regex.test(itemVal);
+      });
+    } else if (operator === 'eq') {
+      this.filters.push((item) => {
+        const itemVal = item[colName] === null || item[colName] === undefined ? '' : String(item[colName]);
+        return itemVal === String(value);
+      });
+    } else {
+      this.filters.push((item) => {
+        const itemVal = item[colName] === null || item[colName] === undefined ? '' : String(item[colName]);
+        return itemVal === String(value);
+      });
+    }
+    return this;
+  }
+
   order(column: string, options?: { ascending?: boolean }) {
     this.sortField = column;
     this.sortAscending = options?.ascending !== false;

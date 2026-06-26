@@ -7,7 +7,6 @@ import { Search, X } from 'lucide-react';
 import {
   STATUS_OPTIONS,
   PRIORITY_OPTIONS,
-  FISCAL_YEAR_OPTIONS,
   MONTH_OPTIONS,
 } from '@/lib/constants';
 
@@ -45,7 +44,6 @@ export function FilterBar() {
     searchParams.has('search') ||
     searchParams.has('general_status') ||
     searchParams.has('priority') ||
-    searchParams.has('fiscal_year') ||
     searchParams.has('responsible_name') ||
     searchParams.has('month') ||
     searchParams.has('year');
@@ -105,18 +103,6 @@ export function FilterBar() {
           ))}
         </select>
 
-        <select
-          className="form-control"
-          style={{ width: 'auto', minWidth: 100 }}
-          value={searchParams.get('fiscal_year') ?? ''}
-          onChange={(e) => updateParam('fiscal_year', e.target.value)}
-          aria-label="Filtrar por FY"
-        >
-          <option value="">FY</option>
-          {FISCAL_YEAR_OPTIONS.map((fy) => (
-            <option key={fy} value={fy}>{fy}</option>
-          ))}
-        </select>
 
         <select
           className="form-control"

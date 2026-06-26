@@ -9,7 +9,6 @@ interface SearchParams {
   search?: string;
   general_status?: string;
   priority?: string;
-  fiscal_year?: string;
   responsible_name?: string;
   month?: string;
   year?: string;
@@ -31,7 +30,7 @@ export default async function HomePage({
   const supabase = await createClient();
 
   const {
-    search, general_status, priority, fiscal_year,
+    search, general_status, priority,
     responsible_name, month, year,
     sort_by = 'entry_date', sort_direction = 'desc',
     page = '1',
@@ -51,7 +50,6 @@ export default async function HomePage({
   }
   if (general_status) query = query.eq('general_status', general_status);
   if (priority) query = query.eq('priority', priority);
-  if (fiscal_year) query = query.eq('fiscal_year', fiscal_year);
   if (responsible_name) query = query.ilike('responsible_name', `%${responsible_name}%`);
 
   if (year && month) {
@@ -61,6 +59,8 @@ export default async function HomePage({
     query = query.gte('entry_date', `${year}-${month}-01`).lt('entry_date', nextMonth);
   } else if (year) {
     query = query.gte('entry_date', `${year}-01-01`).lt('entry_date', `${parseInt(year) + 1}-01-01`);
+  } else if (month) {
+    query = query.filter('entry_date::text', 'like', `????-${month}-??`);
   }
 
   const allowedFields = ['number', 'entry_date', 'client_name', 'responsible_name', 'general_status', 'priority', 'fiscal_year', 'delivery_date'];
