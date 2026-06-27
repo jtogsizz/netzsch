@@ -129,3 +129,29 @@ export interface PaginatedDatabooks {
   page: number;
   page_size: number;
 }
+
+// ── Email Inbound ──────────────────────────────────────────────────────────────
+
+/** Remetente autorizado na whitelist de inbound email */
+export interface EmailSender {
+  id: string;
+  email: string;
+  name: string | null;
+  active: boolean;
+  created_at: string;
+}
+
+export type EmailImportStatus = 'success' | 'duplicate' | 'blocked' | 'error';
+
+/** Log de cada tentativa de importação via email inbound */
+export interface EmailImportLog {
+  id: string;
+  received_at: string;
+  from_address: string;
+  subject: string | null;
+  raw_body: string | null;
+  status: EmailImportStatus;
+  error_message: string | null;
+  databook_number: string | null;
+  databook_id: string | null;
+}

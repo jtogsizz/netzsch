@@ -3,26 +3,26 @@ import { NextResponse } from 'next/server';
 import { createServiceClient } from '@/lib/supabase/server';
 
 // Rota 100% server-side — sem cookies, sem sessão de usuário.
-// Usa SUPABASE_SECRET_KEY (service_role) diretamente.
-// Autenticação via INBOUND_EMAIL_SECRET no header Authorization.
+// Usa SUPABASE_SECRET_KEY (service_role) via createServiceClient().
+// Segurança: INBOUND_EMAIL_SECRET + whitelist de remetentes autorizados.
 export const runtime = 'nodejs';
 export const maxDuration = 30;
 
-// ── Constantes ────────────────────────────────────────────────────────────────
+// ── Regex de extração ─────────────────────────────────────────────────────────
 
 /**
- * Regex para encontrar números de databook/solicitação válidos.
- * Critério: sequência numérica de 5 a 8 dígitos NÃO precedida/seguida
- * por outro dígito (para não capturar CEPs, telefones, anos, etc.).
+ * Regex para números de databook válidos: 5 a 8 dígitos isolados.
+ * (?<!\d) e (?!\d) garantem que não é parte de um número maior.
  */
-const NUMBER_REGEX = /(?<!\d)(\d{5,8})(?!\d)/g;
+const NUMBER_PATTERN = '(?<!\\d)(\\d{5,8})(?!\\d)';
 
 /**
- * Palavras-chave que indicam que o número logo após é o número do databook.
+ * Palavras-chave que indicam que o número seguinte é o do databook.
  * Captura "Databook 500662", "HD 500662", "Solicitação 500662", "DB 500662".
  */
-const KEYWORD_REGEX =
-  /(?:databook|solicitac[aã]o|solicita[cç][aã]o|hd|db|n[uú]mero|num|pedido|os|ordem)\s*[:\-–]?\s*(\d{5,8})(?!\d)/gi;
+const KEYWORD_PATTERN =
+  '(?:databook|solicitac[aã]o|solicita[cç][aã]o|hd|db|n[uú]mero|num|pedido|os|ordem)' +
+  '\\s*[:\\-–]?\\s*(\\d{5,8})(?!\\d)';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -46,41 +46,37 @@ function extractText(payload: any): string {
 }
 
 /**
- * Estratégia de extração de número:
+ * Extrai o número primário e números extras do assunto + corpo.
  *
- * 1. Procura no assunto ou corpo por números PRECEDIDOS de palavra-chave
- *    (Databook, Solicitação, HD, DB, etc.)  → maior confiança.
- * 2. Se não achar pela palavra-chave, pega o primeiro número de 5–8 dígitos
- *    que apareça em qualquer parte do assunto ou corpo.
- * 3. Retorna { primary, extras } onde extras = demais números encontrados.
+ * Estratégia:
+ * 1. Procura número PRECEDIDO de palavra-chave (alta confiança).
+ * 2. Fallback: primeiro número de 5–8 dígitos em qualquer parte do texto.
+ * 3. Extras = demais números encontrados (vão para notes).
  */
-function extractNumbers(subject: string, body: string): {
-  primary: string | null;
-  extras: string[];
-} {
+function extractNumbers(
+  subject: string,
+  body: string
+): { primary: string | null; extras: string[] } {
   const fullText = `${subject}\n${body}`;
 
-  // ── Passo 1: palavra-chave ────────────────────────────────────────────────
+  // Passo 1: palavra-chave
   const keywordMatches: string[] = [];
+  const kwRegex = new RegExp(KEYWORD_PATTERN, 'gi');
   let m: RegExpExecArray | null;
-  const kwRegex = new RegExp(KEYWORD_REGEX.source, 'gi'); // nova instância p/ evitar estado
   while ((m = kwRegex.exec(fullText)) !== null) {
     const num = m[1];
     if (!keywordMatches.includes(num)) keywordMatches.push(num);
   }
 
-  // ── Passo 2: todos os números válidos no texto completo ──────────────────
+  // Passo 2: todos os números válidos
   const allNumbers: string[] = [];
-  const numRegex = new RegExp(NUMBER_REGEX.source, 'g');
+  const numRegex = new RegExp(NUMBER_PATTERN, 'g');
   while ((m = numRegex.exec(fullText)) !== null) {
     const num = m[1];
     if (!allNumbers.includes(num)) allNumbers.push(num);
   }
 
-  // ── Decide o primário ────────────────────────────────────────────────────
   const primary = keywordMatches[0] ?? allNumbers[0] ?? null;
-
-  // Extras = todos os demais números (excluindo o primário)
   const extras = allNumbers.filter((n) => n !== primary);
 
   return { primary, extras };
@@ -92,10 +88,11 @@ function parseLine(line: string): { key: string; value: string } | null {
   if (idx < 0) return null;
   const key = line.slice(0, idx).trim().toLowerCase();
   const value = line.slice(idx + 1).trim();
+  if (!key || !value) return null;
   return { key, value };
 }
 
-/** Normaliza texto removendo acentos e deixando lowercase */
+/** Normaliza texto removendo acentos e deixando lowercase sem caracteres especiais */
 function normalize(s: string): string {
   return s
     .toLowerCase()
@@ -108,43 +105,19 @@ function normalize(s: string): string {
 function resolveField(rawKey: string): string | null {
   const n = normalize(rawKey);
   const map: Record<string, string> = {
-    numero: 'number',
-    num: 'number',
-    solicitacao: 'number',
-    databook: 'number',
-    hd: 'number',
-    db: 'number',
-    cliente: 'client_name',
-    client: 'client_name',
-    nomecliente: 'client_name',
-    empresa: 'company_name',
-    usina: 'company_name',
-    filial: 'technical_status',
-    uf: 'technical_status',
-    statustecnico: 'technical_status',
-    responsavel: 'responsible_name',
-    responsible: 'responsible_name',
-    status: 'general_status',
-    situacao: 'general_status',
-    generalstatus: 'general_status',
-    prioridade: 'priority',
-    priority: 'priority',
-    entrada: 'entry_date',
-    abertura: 'entry_date',
-    dataabertura: 'entry_date',
-    entrega: 'delivery_date',
-    prazo: 'delivery_date',
-    previsao: 'delivery_date',
-    tipo: 'type',
-    type: 'type',
-    fy: 'fiscal_year',
-    anofiscal: 'fiscal_year',
-    fiscalyear: 'fiscal_year',
-    obs: 'notes',
-    observacao: 'notes',
-    observacoes: 'notes',
-    notes: 'notes',
-    nota: 'notes',
+    numero: 'number', num: 'number', solicitacao: 'number',
+    databook: 'number', hd: 'number', db: 'number',
+    cliente: 'client_name', client: 'client_name', nomecliente: 'client_name',
+    empresa: 'company_name', usina: 'company_name',
+    filial: 'technical_status', uf: 'technical_status', statustecnico: 'technical_status',
+    responsavel: 'responsible_name', responsible: 'responsible_name',
+    status: 'general_status', situacao: 'general_status', generalstatus: 'general_status',
+    prioridade: 'priority', priority: 'priority',
+    entrada: 'entry_date', abertura: 'entry_date', dataabertura: 'entry_date',
+    entrega: 'delivery_date', prazo: 'delivery_date', previsao: 'delivery_date',
+    tipo: 'type', type: 'type',
+    fy: 'fiscal_year', anofiscal: 'fiscal_year', fiscalyear: 'fiscal_year',
+    obs: 'notes', observacao: 'notes', observacoes: 'notes', notes: 'notes', nota: 'notes',
   };
   return map[n] ?? null;
 }
@@ -153,8 +126,6 @@ function resolveField(rawKey: string): string | null {
 function parseDate(value: string): string | null {
   if (!value) return null;
   const trimmed = value.trim();
-
-  // DD/MM/AAAA ou DD/MM/AA
   if (trimmed.includes('/')) {
     const parts = trimmed.split('/');
     if (parts.length === 3) {
@@ -166,17 +137,12 @@ function parseDate(value: string): string | null {
       if (!isNaN(d.getTime())) return `${year}-${month}-${day}`;
     }
   }
-
-  // AAAA-MM-DD
   if (/^\d{4}-\d{2}-\d{2}/.test(trimmed)) return trimmed.slice(0, 10);
-
-  // Fallback
   const parsed = new Date(trimmed);
   if (!isNaN(parsed.getTime())) return parsed.toISOString().split('T')[0];
   return null;
 }
 
-/** Normaliza general_status */
 function parseStatus(value: string): 'Novo' | 'Em andamento' | 'Encerrado' {
   const upper = value.toUpperCase();
   if (upper.includes('ENCERRADO') || upper.includes('CLOSED') || upper.includes('DONE'))
@@ -186,35 +152,25 @@ function parseStatus(value: string): 'Novo' | 'Em andamento' | 'Encerrado' {
   return 'Novo';
 }
 
-/** Normaliza priority */
 function parsePriority(value: string): 'Alta' | 'Normal' | 'Baixa' {
   const upper = value.toUpperCase();
-  if (upper.includes('ALTA') || upper.includes('HIGH') || upper.includes('URGENTE'))
-    return 'Alta';
+  if (upper.includes('ALTA') || upper.includes('HIGH') || upper.includes('URGENTE')) return 'Alta';
   if (upper.includes('BAIXA') || upper.includes('LOW')) return 'Baixa';
   return 'Normal';
 }
 
 /**
- * Parser estruturado (opcional, compatibilidade com o formato "Campo: Valor").
- * Funciona quando o email contém linhas como:
- *   Cliente: Empresa ABC
- *   Responsável: João
- *   Status: Novo
- * O campo "number" do parser estruturado é ignorado aqui —
- * o número já foi extraído pelo extractNumbers() antes.
+ * Parser estruturado — opcional, para emails que contenham linhas "Campo: Valor".
+ * O campo 'number' é ignorado aqui (já extraído por extractNumbers).
  */
 function parseStructuredFields(text: string): Record<string, string> {
   const fields: Record<string, string> = {};
-  const lines = text.split('\n');
-
-  for (const line of lines) {
+  for (const line of text.split('\n')) {
     const trimmed = line.trim();
     if (!trimmed) continue;
     const parsed = parseLine(trimmed);
     if (!parsed) continue;
     const canonical = resolveField(parsed.key);
-    // Ignora o campo 'number' aqui — já tratado pelo extractNumbers
     if (canonical && canonical !== 'number' && parsed.value) {
       fields[canonical] = parsed.value;
     }
@@ -222,29 +178,59 @@ function parseStructuredFields(text: string): Record<string, string> {
   return fields;
 }
 
-// ── Handler ───────────────────────────────────────────────────────────────────
+// ── Tipos internos ────────────────────────────────────────────────────────────
+
+type LogStatus = 'success' | 'duplicate' | 'blocked' | 'error';
+
+interface ImportLogEntry {
+  from_address: string;
+  subject: string;
+  raw_body: string;
+  status: LogStatus;
+  error_message: string | null;
+  databook_number: string | null;
+  databook_id: string | null;
+}
+
+// ── Log auxiliar ──────────────────────────────────────────────────────────────
+
+async function logImport(entry: ImportLogEntry): Promise<void> {
+  try {
+    const supabase = createServiceClient();
+    await (supabase as any).from('email_import_logs').insert({
+      from_address: entry.from_address,
+      subject: entry.subject,
+      raw_body: entry.raw_body.slice(0, 4000),
+      status: entry.status,
+      error_message: entry.error_message,
+      databook_number: entry.databook_number,
+      databook_id: entry.databook_id,
+    });
+  } catch (err) {
+    console.error('[inbound-email] Erro ao gravar email_import_logs:', err);
+  }
+}
+
+// ── Handler principal ─────────────────────────────────────────────────────────
 
 /**
  * POST /api/inbound-email
  *
- * Webhook chamado pelo Resend quando um email inbound chega.
- * Payload esperado (Resend Inbound Webhook v1):
- *   { from, to, subject, text, html, headers, ... }
+ * Webhook chamado pela Resend quando um email chega em databook@prenaarok.resend.app.
+ * Payload (Resend Inbound Webhook v1): { from, to, subject, text, html, headers, ... }
  *
- * Autenticação: Bearer <INBOUND_EMAIL_SECRET> no header Authorization.
+ * Fluxo de segurança:
+ *   1. Valida INBOUND_EMAIL_SECRET no header Authorization
+ *   2. Valida remetente na whitelist inbound_email_allowed_senders (active = true)
+ *   3. Extrai número do assunto/corpo (5–8 dígitos)
+ *   4. Verifica duplicata em databooks — opção A: não cria, registra 'duplicate'
+ *   5. Cria databook com defaults + grava audit_log e email_import_log
  *
- * O email NÃO precisa estar formatado. Basta conter o número (5–8 dígitos)
- * em qualquer parte do assunto ou corpo — por exemplo:
- *   Subject: "Novo databook 500662"
- *   Body:    "Segue solicitação 500662 recebida por email."
- *
- * Campos estruturados (opcional):
- *   Cliente: Empresa ABC
- *   Responsável: João
- *   Status: Em andamento
+ * Retorna sempre 200 para blocked/duplicate/error controlado
+ * para que a Resend não reencaminhe o webhook como falha.
  */
 export async function POST(request: Request) {
-  // ── 1. Autenticação via secret ────────────────────────────────────────────
+  // ── 1. Autenticação via secret ─────────────────────────────────────────────
   const authHeader = request.headers.get('authorization') ?? '';
   const secret = process.env.INBOUND_EMAIL_SECRET;
 
@@ -259,10 +245,11 @@ export async function POST(request: Request) {
 
   if (providedToken !== secret) {
     console.warn('[inbound-email] Token inválido recebido');
+    // 401 aqui é OK — token errado indica requisição maliciosa, não Resend
     return NextResponse.json({ error: 'Não autorizado' }, { status: 401 });
   }
 
-  // ── 2. Parse do payload ──────────────────────────────────────────────────
+  // ── 2. Parse do payload ────────────────────────────────────────────────────
   let payload: any;
   try {
     payload = await request.json();
@@ -270,21 +257,64 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: 'Payload JSON inválido' }, { status: 400 });
   }
 
-  const fromAddress: string = payload?.from ?? '';
+  // Normaliza o endereço do remetente (pode vir como "Nome <email>" ou só "email")
+  const rawFrom: string = payload?.from ?? '';
+  const fromAddress = rawFrom.match(/<([^>]+)>/)?.[1]?.toLowerCase().trim()
+    ?? rawFrom.toLowerCase().trim();
   const subject: string = payload?.subject ?? '';
   const emailText = extractText(payload);
-
-  // Fonte de busca: assunto + corpo (mesmo que corpo esteja vazio)
   const searchText = emailText || subject;
 
-  // ── 3. Extração inteligente do número ────────────────────────────────────
+  // ── 3. Validação da whitelist ──────────────────────────────────────────────
+  const supabase = createServiceClient();
+
+  const { data: senderRow, error: senderError } = await (supabase as any)
+    .from('inbound_email_allowed_senders')
+    .select('id, email, name, active')
+    .eq('email', fromAddress)
+    .maybeSingle();
+
+  if (senderError) {
+    console.error('[inbound-email] Erro ao consultar whitelist:', senderError);
+    await logImport({
+      from_address: fromAddress,
+      subject,
+      raw_body: searchText,
+      status: 'error',
+      error_message: `Erro ao consultar whitelist: ${senderError.message}`,
+      databook_number: null,
+      databook_id: null,
+    });
+    // Retorna 200 para não causar reenvio pela Resend
+    return NextResponse.json({ received: true, action: 'error', reason: 'whitelist_query_failed' });
+  }
+
+  if (!senderRow || !senderRow.active) {
+    const reason = !senderRow
+      ? 'Remetente não encontrado na whitelist'
+      : 'Remetente desativado na whitelist';
+    console.warn(`[inbound-email] Bloqueado: ${fromAddress} — ${reason}`);
+    await logImport({
+      from_address: fromAddress,
+      subject,
+      raw_body: searchText,
+      status: 'blocked',
+      error_message: reason,
+      databook_number: null,
+      databook_id: null,
+    });
+    // 200 para não causar reenvio pela Resend
+    return NextResponse.json({ received: true, action: 'blocked', reason });
+  }
+
+  // ── 4. Extração do número ──────────────────────────────────────────────────
   const { primary: databookNumber, extras: extraNumbers } = extractNumbers(
     subject,
     emailText
   );
 
   if (!databookNumber) {
-    const msg = 'Nenhum número de databook encontrado no assunto ou corpo do email';
+    const msg = 'Nenhum número de databook (5–8 dígitos) encontrado no email';
     console.warn(`[inbound-email] ${msg}. From: ${fromAddress} | Subject: ${subject}`);
     await logImport({
       from_address: fromAddress,
@@ -295,31 +325,64 @@ export async function POST(request: Request) {
       databook_number: null,
       databook_id: null,
     });
-    return NextResponse.json({ error: msg }, { status: 422 });
+    return NextResponse.json({ received: true, action: 'error', reason: msg });
   }
 
-  // ── 4. Parser estruturado (opcional) ─────────────────────────────────────
-  // Lê campos adicionais se o email contiver linhas "Campo: Valor"
-  const structuredFields = parseStructuredFields(emailText);
+  // ── 5. Verificar duplicata (opção A: não criar nem atualizar) ──────────────
+  const { data: existing, error: fetchError } = await (supabase as any)
+    .from('databooks')
+    .select('id, number')
+    .eq('number', databookNumber)
+    .maybeSingle();
 
-  // ── 5. Monta a nota base ──────────────────────────────────────────────────
-  // Se o email veio com campos estruturados, usa as notas deles;
-  // caso contrário, gera nota informativa padrão.
+  if (fetchError) {
+    console.error('[inbound-email] Erro ao buscar databook existente:', fetchError);
+    await logImport({
+      from_address: fromAddress,
+      subject,
+      raw_body: searchText,
+      status: 'error',
+      error_message: `Erro ao consultar banco: ${fetchError.message}`,
+      databook_number: databookNumber,
+      databook_id: null,
+    });
+    return NextResponse.json({ received: true, action: 'error', reason: 'db_query_failed' });
+  }
+
+  if (existing) {
+    const msg = `Databook ${databookNumber} já existe no sistema`;
+    console.info(`[inbound-email] Duplicata ignorada: ${msg}`);
+    await logImport({
+      from_address: fromAddress,
+      subject,
+      raw_body: searchText,
+      status: 'duplicate',
+      error_message: msg,
+      databook_number: databookNumber,
+      databook_id: existing.id,
+    });
+    return NextResponse.json({
+      received: true,
+      action: 'duplicate',
+      databook_number: databookNumber,
+      databook_id: existing.id,
+    });
+  }
+
+  // ── 6. Parser estruturado (opcional) ──────────────────────────────────────
+  const structuredFields = parseStructuredFields(emailText);
   const hasStructuredData = Object.keys(structuredFields).length > 0;
 
-  let notesValue: string;
-  if (hasStructuredData && structuredFields['notes']) {
-    notesValue = structuredFields['notes'];
-  } else {
-    notesValue = 'Criado automaticamente por email. Completar dados manualmente.';
-  }
+  // Nota automática
+  let notesValue = hasStructuredData && structuredFields['notes']
+    ? structuredFields['notes']
+    : 'Criado automaticamente por email. Completar dados manualmente.';
 
-  // Acrescenta números extras encontrados no email (para rastreabilidade)
   if (extraNumbers.length > 0) {
     notesValue += ` | Outros números no email: ${extraNumbers.join(', ')}`;
   }
 
-  // ── 6. Monta objeto de inserção ──────────────────────────────────────────
+  // ── 7. Monta e insere o databook ───────────────────────────────────────────
   const databookData = {
     number: databookNumber,
     client_name: structuredFields['client_name'] || null,
@@ -344,93 +407,33 @@ export async function POST(request: Request) {
     source: 'email',
   };
 
-  // ── 7. Verificar duplicidade e inserir/atualizar ──────────────────────────
-  const supabase = createServiceClient();
-
-  const { data: existing, error: fetchError } = await (supabase as any)
+  const { data: created, error: insertError } = await (supabase as any)
     .from('databooks')
-    .select('id, number')
-    .eq('number', databookNumber)
-    .maybeSingle();
+    .insert(databookData)
+    .select('id')
+    .single();
 
-  if (fetchError) {
-    console.error('[inbound-email] Erro ao buscar databook existente:', fetchError);
+  if (insertError) {
+    console.error('[inbound-email] Erro ao criar databook:', insertError);
     await logImport({
       from_address: fromAddress,
       subject,
       raw_body: searchText,
       status: 'error',
-      error_message: `Erro ao consultar banco: ${fetchError.message}`,
+      error_message: `Erro ao criar databook: ${insertError.message}`,
       databook_number: databookNumber,
       databook_id: null,
     });
-    return NextResponse.json({ error: 'Erro interno ao consultar banco' }, { status: 500 });
+    return NextResponse.json({ received: true, action: 'error', reason: 'insert_failed' });
   }
 
-  let databookId: string | null = null;
-  let action: 'created' | 'updated' = 'created';
+  const databookId: string | null = created?.id ?? null;
 
-  if (existing) {
-    // ── Atualiza somente os campos que vieram estruturados
-    // (não sobrescreve dados manuais com defaults do email simples)
-    const updateData: Record<string, unknown> = { source: 'email' };
-    if (hasStructuredData) {
-      Object.assign(updateData, databookData);
-    }
-
-    const { data: updated, error: updateError } = await (supabase as any)
-      .from('databooks')
-      .update(updateData)
-      .eq('id', existing.id)
-      .select('id')
-      .single();
-
-    if (updateError) {
-      console.error('[inbound-email] Erro ao atualizar databook:', updateError);
-      await logImport({
-        from_address: fromAddress,
-        subject,
-        raw_body: searchText,
-        status: 'error',
-        error_message: `Erro ao atualizar: ${updateError.message}`,
-        databook_number: databookNumber,
-        databook_id: existing.id,
-      });
-      return NextResponse.json({ error: 'Erro ao atualizar databook' }, { status: 500 });
-    }
-
-    databookId = updated?.id ?? existing.id;
-    action = 'updated';
-  } else {
-    // ── Cria novo databook com os dados do email
-    const { data: created, error: insertError } = await (supabase as any)
-      .from('databooks')
-      .insert(databookData)
-      .select('id')
-      .single();
-
-    if (insertError) {
-      console.error('[inbound-email] Erro ao criar databook:', insertError);
-      await logImport({
-        from_address: fromAddress,
-        subject,
-        raw_body: searchText,
-        status: 'error',
-        error_message: `Erro ao criar: ${insertError.message}`,
-        databook_number: databookNumber,
-        databook_id: null,
-      });
-      return NextResponse.json({ error: 'Erro ao criar databook' }, { status: 500 });
-    }
-
-    databookId = created?.id ?? null;
-  }
-
-  // ── 8. Audit log ──────────────────────────────────────────────────────────
+  // ── 8. Audit log ───────────────────────────────────────────────────────────
   if (databookId) {
     await (supabase as any).from('audit_logs').insert({
       databook_id: databookId,
-      action,
+      action: 'created',
       field_name: null,
       old_value: null,
       new_value: databookNumber,
@@ -438,7 +441,7 @@ export async function POST(request: Request) {
     });
   }
 
-  // ── 9. Log de importação ──────────────────────────────────────────────────
+  // ── 9. Log de importação ───────────────────────────────────────────────────
   await logImport({
     from_address: fromAddress,
     subject,
@@ -450,45 +453,16 @@ export async function POST(request: Request) {
   });
 
   console.log(
-    `[inbound-email] ${action === 'created' ? 'Criado' : 'Atualizado'} databook ` +
-    `${databookNumber} via email de ${fromAddress}` +
-    (extraNumbers.length ? ` (outros números: ${extraNumbers.join(', ')})` : '')
+    `[inbound-email] Criado databook ${databookNumber} via email de ${fromAddress}` +
+    (senderRow.name ? ` (${senderRow.name})` : '') +
+    (extraNumbers.length ? ` | outros números: ${extraNumbers.join(', ')}` : '')
   );
 
   return NextResponse.json({
-    success: true,
-    action,
+    received: true,
+    action: 'created',
     databook_number: databookNumber,
     databook_id: databookId,
     ...(extraNumbers.length > 0 && { other_numbers_found: extraNumbers }),
   });
-}
-
-// ── Log auxiliar ──────────────────────────────────────────────────────────────
-
-interface ImportLogEntry {
-  from_address: string;
-  subject: string;
-  raw_body: string;
-  status: 'success' | 'error';
-  error_message: string | null;
-  databook_number: string | null;
-  databook_id: string | null;
-}
-
-async function logImport(entry: ImportLogEntry) {
-  try {
-    const supabase = createServiceClient();
-    await (supabase as any).from('email_import_logs').insert({
-      from_address: entry.from_address,
-      subject: entry.subject,
-      raw_body: entry.raw_body.slice(0, 4000),
-      status: entry.status,
-      error_message: entry.error_message,
-      databook_number: entry.databook_number,
-      databook_id: entry.databook_id,
-    });
-  } catch (err) {
-    console.error('[inbound-email] Erro ao gravar email_import_logs:', err);
-  }
 }

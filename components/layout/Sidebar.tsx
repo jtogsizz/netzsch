@@ -7,6 +7,9 @@ import {
   BarChart2,
   Users,
   LogOut,
+  Mail,
+  ShieldCheck,
+  ScrollText,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { createClient } from '@/lib/supabase/client';
@@ -16,6 +19,11 @@ const NAV_ITEMS = [
   { href: '/', label: 'Databooks', icon: FileText, exact: true },
   { href: '/reports', label: 'Relatórios', icon: BarChart2 },
   { href: '/employees', label: 'Responsáveis', icon: Users },
+];
+
+const EMAIL_NAV_ITEMS = [
+  { href: '/settings/senders', label: 'Remetentes', icon: ShieldCheck },
+  { href: '/settings/email-logs', label: 'Logs de Email', icon: ScrollText },
 ];
 
 export function Sidebar() {
@@ -35,6 +43,10 @@ export function Sidebar() {
     if (exact) return pathname === href;
     return pathname.startsWith(href);
   };
+
+  const isEmailSectionActive = EMAIL_NAV_ITEMS.some(({ href }) =>
+    pathname.startsWith(href)
+  );
 
   // Iniciais do sistema para o avatar
   const initials = 'NZ';
@@ -62,12 +74,41 @@ export function Sidebar() {
             {label}
           </Link>
         ))}
+
+        {/* Seção Email */}
+        <div className="sidebar-section-label">
+          <Mail size={11} strokeWidth={2} />
+          Email
+        </div>
+        {EMAIL_NAV_ITEMS.map(({ href, label, icon: Icon }) => (
+          <Link
+            key={href}
+            href={href}
+            className={cn(
+              'sidebar-nav-item sidebar-nav-item--sub',
+              isActive(href) && 'active'
+            )}
+            aria-current={isActive(href) ? 'page' : undefined}
+          >
+            <Icon size={14} strokeWidth={1.75} />
+            {label}
+          </Link>
+        ))}
       </div>
 
       {/* Footer com usuario e logout */}
       <div className="sidebar-footer">
         <div className="sidebar-user">
-          <div className="sidebar-user-avatar">{initials}</div>
+          <div
+            className="sidebar-user-avatar"
+            style={{
+              background: isEmailSectionActive
+                ? 'var(--brand-600)'
+                : undefined,
+            }}
+          >
+            {initials}
+          </div>
           <span style={{ fontSize: '0.8125rem', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
             Sistema interno
           </span>

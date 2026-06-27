@@ -142,13 +142,76 @@ supabase/
 
 ## Email Inbound (Resend)
 
-Funcionarios podem criar databooks apenas **encaminhando um email** — sem precisar acessar o sistema.
+Funcionarios podem criar databooks apenas **encaminhando um email** para:
+
+```
+databook@prenaarok.resend.app
+```
+
+O sistema valida o remetente, extrai o numero e cria o databook automaticamente.
+
+---
 
 ### Como funciona
 
-O funcionario encaminha (ou escreve) um email para o endereco configurado no Resend (ex.: `inbound@seudominio.com`). O sistema extrai automaticamente o numero do databook do assunto ou corpo do email.
+1. Funcionario autorizado encaminha email para `databook@prenaarok.resend.app`
+2. A Resend recebe o email e dispara o webhook para `/api/inbound-email`
+3. O sistema valida o `INBOUND_EMAIL_SECRET` e a whitelist de remetentes
+4. O numero do databook e extraido do assunto ou corpo
+5. Se o numero ja existir: registra `duplicate`, nao altera o databook
+6. Se for novo: cria o databook com status `Novo` e source `email`
 
-**Exemplos de emails aceitos:**
+---
+
+### Seguranca
+
+| Camada | Mecanismo |
+|--------|-----------|
+| Token | `INBOUND_EMAIL_SECRET` no header `Authorization: Bearer` |
+| Whitelist | Tabela `inbound_email_allowed_senders` — apenas emails com `active = true` |
+| Deduplicacao | Se o numero ja existir, registra `duplicate` e nao cria nem altera |
+| Retorno 200 | blocked/duplicate/error controlado retornam 200 para evitar reenvios do Resend |
+
+---
+
+### Configuracao do webhook Resend
+
+1. Acesse **Resend → Inbound**
+2. Configure o dominio `prenaarok.resend.app` (ja configurado)
+3. Em **Webhook URL**: `https://SEU_PROJETO.vercel.app/api/inbound-email`
+4. Em **Authorization header**: `Bearer <valor_do_INBOUND_EMAIL_SECRET>`
+
+---
+
+### Variaveis de ambiente necessarias
+
+```env
+INBOUND_EMAIL_SECRET=<token_secreto>  # gerar com: openssl rand -hex 32
+SUPABASE_SECRET_KEY=<service_role_key> # ja existente
+```
+
+---
+
+### Gerenciamento da whitelist
+
+Acesse no sistema:
+- **Sidebar → Email → Remetentes** (`/settings/senders`) — adicionar/editar/desativar
+- **Sidebar → Email → Logs de Email** (`/settings/email-logs`) — auditoria completa
+
+---
+
+### Status dos logs
+
+| Status | Significado |
+|--------|-------------|
+| `success` | Databook criado com sucesso |
+| `duplicate` | Numero ja existe — nenhuma acao tomada |
+| `blocked` | Remetente nao esta na whitelist ou esta inativo |
+| `error` | Erro no processamento (sem numero, falha no banco, etc.) |
+
+---
+
+### Exemplos de emails aceitos
 
 ```
 Assunto: Novo databook 500662
@@ -157,7 +220,7 @@ Corpo:   Segue solicitação 500662 recebida por email.
 
 ```
 Assunto: HD 500662
-Corpo:   (qualquer texto)
+Corpo:   (qualquer texto ou vazio)
 ```
 
 ```
@@ -165,14 +228,9 @@ Assunto: FW: Solicitação de peças
 Corpo:   Segue databook 500662 para providências.
 ```
 
-O numero pode aparecer em qualquer lugar do assunto ou corpo — o parser encontra automaticamente qualquer sequencia de 5 a 8 digitos.
+O numero pode aparecer em qualquer parte do email — o parser detecta automaticamente qualquer sequencia de 5 a 8 digitos.
 
-### Regras de extracao
-
-1. **Palavra-chave + numero** tem prioridade: `Databook 500662`, `Solicitacao 500662`, `HD 500662`, `DB 500662`
-2. **Primeiro numero valido** (5–8 digitos) em qualquer parte do texto, se nao houver palavra-chave
-3. **Multiplos numeros**: o primeiro valido vira o numero principal; os demais ficam registrados nas observacoes
-4. **Sem numero**: nao cria databook; registra em `email_import_logs` como erro para revisao
+---
 
 ### Defaults ao criar via email simples
 
@@ -185,47 +243,42 @@ O numero pode aparecer em qualquer lugar do assunto ou corpo — o parser encont
 | `source` | email |
 | `notes` | "Criado automaticamente por email. Completar dados manualmente." |
 
-### Campos estruturados (opcional)
+---
 
-Se o email contiver linhas no formato `Campo: Valor`, o parser tambem le:
+### Testes via curl
 
-```
-Cliente: Empresa ABC
-Responsavel: Joao Silva
-Status: Em andamento
-Prioridade: Alta
-```
-
-Esses campos sao **opcionais** — o email pode conter apenas o numero.
-
-### Configuracao
-
-1. Adicione a variavel `INBOUND_EMAIL_SECRET` na Vercel (token forte gerado com `openssl rand -hex 32`)
-2. Configure o Resend Inbound:
-   - Webhook URL: `https://seu-projeto.vercel.app/api/inbound-email`
-   - Authorization header: `Bearer <valor_do_INBOUND_EMAIL_SECRET>`
-3. Execute o SQL de migration (`sql_migration.sql`) no Supabase para criar a coluna `source` e a tabela `email_import_logs`
-
-### Teste via curl
-
+**Criar databook (remetente autorizado e numero novo):**
 ```bash
-curl -X POST https://SEU_DOMINIO/api/inbound-email \
+curl -X POST https://SEU_PROJETO.vercel.app/api/inbound-email \
   -H "Authorization: Bearer SEU_SECRET" \
   -H "Content-Type: application/json" \
   -d '{
     "from": "funcionario@empresa.com",
-    "to": "inbound@seudominio.com",
+    "to": "databook@prenaarok.resend.app",
     "subject": "Novo databook 500662",
     "text": "Segue solicitação 500662 recebida por email."
   }'
 ```
 
-**Resposta esperada:**
+Resposta:
 ```json
-{
-  "success": true,
-  "action": "created",
-  "databook_number": "500662",
-  "databook_id": "<uuid>"
-}
+{ "received": true, "action": "created", "databook_number": "500662", "databook_id": "<uuid>" }
 ```
+
+**Remetente nao autorizado:**
+```json
+{ "received": true, "action": "blocked", "reason": "Remetente não encontrado na whitelist" }
+```
+
+**Numero ja existe (duplicata):**
+```json
+{ "received": true, "action": "duplicate", "databook_number": "500662", "databook_id": "<uuid>" }
+```
+
+---
+
+### SQL Migration
+
+Execute `sql_migration.sql` no **SQL Editor** do Supabase.
+Cria: `inbound_email_allowed_senders`, atualiza constraint `email_import_logs.status`.
+
