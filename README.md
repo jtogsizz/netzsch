@@ -137,3 +137,95 @@ supabase/
 - Estrutura da API `/api/databooks` suporta import em massa (endpoint a implementar).
 - Tabela `employees` suporta multiplos usuarios com permissoes.
 - `SUPABASE_SECRET_KEY` permite operacoes admin sem alterar RLS.
+
+---
+
+## Email Inbound (Resend)
+
+Funcionarios podem criar databooks apenas **encaminhando um email** — sem precisar acessar o sistema.
+
+### Como funciona
+
+O funcionario encaminha (ou escreve) um email para o endereco configurado no Resend (ex.: `inbound@seudominio.com`). O sistema extrai automaticamente o numero do databook do assunto ou corpo do email.
+
+**Exemplos de emails aceitos:**
+
+```
+Assunto: Novo databook 500662
+Corpo:   Segue solicitação 500662 recebida por email.
+```
+
+```
+Assunto: HD 500662
+Corpo:   (qualquer texto)
+```
+
+```
+Assunto: FW: Solicitação de peças
+Corpo:   Segue databook 500662 para providências.
+```
+
+O numero pode aparecer em qualquer lugar do assunto ou corpo — o parser encontra automaticamente qualquer sequencia de 5 a 8 digitos.
+
+### Regras de extracao
+
+1. **Palavra-chave + numero** tem prioridade: `Databook 500662`, `Solicitacao 500662`, `HD 500662`, `DB 500662`
+2. **Primeiro numero valido** (5–8 digitos) em qualquer parte do texto, se nao houver palavra-chave
+3. **Multiplos numeros**: o primeiro valido vira o numero principal; os demais ficam registrados nas observacoes
+4. **Sem numero**: nao cria databook; registra em `email_import_logs` como erro para revisao
+
+### Defaults ao criar via email simples
+
+| Campo | Valor padrao |
+|-------|-------------|
+| `general_status` | Novo |
+| `priority` | Normal |
+| `type` | Pecas |
+| `entry_date` | Data atual |
+| `source` | email |
+| `notes` | "Criado automaticamente por email. Completar dados manualmente." |
+
+### Campos estruturados (opcional)
+
+Se o email contiver linhas no formato `Campo: Valor`, o parser tambem le:
+
+```
+Cliente: Empresa ABC
+Responsavel: Joao Silva
+Status: Em andamento
+Prioridade: Alta
+```
+
+Esses campos sao **opcionais** — o email pode conter apenas o numero.
+
+### Configuracao
+
+1. Adicione a variavel `INBOUND_EMAIL_SECRET` na Vercel (token forte gerado com `openssl rand -hex 32`)
+2. Configure o Resend Inbound:
+   - Webhook URL: `https://seu-projeto.vercel.app/api/inbound-email`
+   - Authorization header: `Bearer <valor_do_INBOUND_EMAIL_SECRET>`
+3. Execute o SQL de migration (`sql_migration.sql`) no Supabase para criar a coluna `source` e a tabela `email_import_logs`
+
+### Teste via curl
+
+```bash
+curl -X POST https://SEU_DOMINIO/api/inbound-email \
+  -H "Authorization: Bearer SEU_SECRET" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "from": "funcionario@empresa.com",
+    "to": "inbound@seudominio.com",
+    "subject": "Novo databook 500662",
+    "text": "Segue solicitação 500662 recebida por email."
+  }'
+```
+
+**Resposta esperada:**
+```json
+{
+  "success": true,
+  "action": "created",
+  "databook_number": "500662",
+  "databook_id": "<uuid>"
+}
+```

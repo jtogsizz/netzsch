@@ -27,6 +27,7 @@ export interface Databook {
   type: string | null;
   fiscal_year: string | null;
   notes: string | null;
+  source: string | null;  // 'email' | 'manual' | null
   created_at: string;
   updated_at: string;
 }
@@ -44,6 +45,7 @@ export interface DatabookInsert {
   type?: string | null;
   fiscal_year?: string | null;
   notes?: string | null;
+  source?: string | null;
 }
 
 export type DatabookUpdate = Partial<DatabookInsert>;

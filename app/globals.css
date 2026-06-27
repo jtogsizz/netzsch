@@ -1674,3 +1674,51 @@ textarea.form-control {
     --content-padding: 1.5rem;
   }
 }
+
+/* =========================================================
+   Badge de Origem por Email — coluna Número
+   ========================================================= */
+
+.email-origin-badges {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 3px;
+}
+
+.email-origin-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 0.625rem;        /* 10px */
+  font-weight: 500;
+  letter-spacing: 0.03em;
+  padding: 1px 5px;
+  border-radius: 3px;
+  background: #e8f0fe;
+  color: #3b5bdb;
+  border: 1px solid #c5d3fb;
+  line-height: 1.4;
+  white-space: nowrap;
+  width: fit-content;
+}
+
+.email-origin-badge::before {
+  content: '✉';
+  font-size: 0.55rem;
+}
+
+.email-pending-badge {
+  display: inline-flex;
+  align-items: center;
+  font-size: 0.575rem;        /* ~9px */
+  font-weight: 500;
+  padding: 1px 4px;
+  border-radius: 3px;
+  background: #fff9db;
+  color: #b25e00;
+  border: 1px solid #ffe066;
+  line-height: 1.4;
+  white-space: nowrap;
+  width: fit-content;
+}

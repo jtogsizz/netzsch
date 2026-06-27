@@ -113,7 +113,17 @@ export function DatabookTable({ data, sortBy, sortDirection, onSort }: DatabookT
                 key={db.id}
                 className={db.priority === 'Alta' ? 'priority-high' : ''}
               >
-                <td style={{ fontWeight: 600, whiteSpace: 'nowrap' }}>{db.number}</td>
+                <td style={{ fontWeight: 600, whiteSpace: 'nowrap' }}>
+                  {db.number}
+                  {db.source === 'email' && (
+                    <span className="email-origin-badges">
+                      <span className="email-origin-badge">Email</span>
+                      {(!db.client_name && !db.responsible_name) && (
+                        <span className="email-pending-badge">Dados pendentes</span>
+                      )}
+                    </span>
+                  )}
+                </td>
                 <td style={{ whiteSpace: 'nowrap' }}>{formatDate(db.entry_date)}</td>
                 <td title={db.client_name ?? ''}>{truncate(db.client_name, 25)}</td>
                 <td>{db.technical_status ?? '-'}</td>
