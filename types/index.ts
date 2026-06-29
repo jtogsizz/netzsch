@@ -141,17 +141,108 @@ export interface EmailSender {
   created_at: string;
 }
 
+/**
+ * Status legado do webhook — mantido para compatibilidade com registros antigos.
+ * Novos registros ainda gravam este campo, mas o fluxo usa queue_status.
+ */
 export type EmailImportStatus = 'success' | 'duplicate' | 'blocked' | 'error';
+
+/**
+ * Status da fila de aprovação.
+ * - pending:   recebido, aguardando revisão do operador
+ * - approved:  operador clicou "Adicionar ao Sistema" — databook criado
+ * - duplicate: número já existe no sistema — nenhuma ação necessária
+ * - blocked:   remetente não autorizado — nenhuma ação disponível
+ * - error:     falha técnica — verificar error_message
+ */
+export type EmailQueueStatus = 'pending' | 'approved' | 'duplicate' | 'blocked' | 'error';
 
 /** Log de cada tentativa de importação via email inbound */
 export interface EmailImportLog {
   id: string;
   received_at: string;
+  /** Email do remetente (extraído do campo from, sem o nome) */
   from_address: string;
+  /** Nome do remetente, quando disponível no campo "from" do payload */
+  from_name: string | null;
+  /** Destinatário do email */
+  to_address: string | null;
   subject: string | null;
+  /** Corpo do email em texto puro */
   raw_body: string | null;
+  /** Corpo do email em HTML (salvo quando disponível no payload) */
+  raw_html: string | null;
+  /** Campos estruturados extraídos do corpo (ex.: { client_name, responsible_name }) */
+  extracted_fields: Record<string, string> | null;
+  /** Status legado do webhook */
   status: EmailImportStatus;
+  /** Status da fila de aprovação (campo principal para o fluxo de revisão) */
+  queue_status: EmailQueueStatus;
   error_message: string | null;
   databook_number: string | null;
   databook_id: string | null;
+}
+
+/** Contagens para o dashboard de emails */
+export interface EmailLogStats {
+  /** Total de emails recebidos hoje (pelo received_at) */
+  today: number;
+  /** Aguardando revisão */
+  pending: number;
+  /** Criados no sistema */
+  approved: number;
+  /** Bloqueados (remetente não autorizado) */
+  blocked: number;
+}
+
+// ── Histórico de Atividades (estrutura para expansão futura) ──────────────────
+
+/**
+ * Tipos de evento que serão registrados no histórico do Databook.
+ * Mapeiam para a coluna `action` da tabela audit_logs.
+ *
+ * Eventos já suportados: 'created' | 'updated' | 'deleted'
+ * Eventos futuros planejados (adicionar ao CHECK constraint do banco):
+ *   - 'email_received'    → criado via email inbound
+ *   - 'responsible_changed' → responsável alterado
+ *   - 'file_uploaded'    → arquivo enviado
+ *   - 'status_changed'   → status alterado
+ *   - 'comment_added'    → comentário inserido (não implementado ainda)
+ */
+export type ActivityEventType =
+  | 'created'
+  | 'updated'
+  | 'deleted'
+  | 'email_received'
+  | 'responsible_changed'
+  | 'file_uploaded'
+  | 'status_changed'
+  | 'comment_added';
+
+// ── Anexos de Databook (estrutura preparada — upload não implementado ainda) ───
+
+/**
+ * Arquivo vinculado a um Databook.
+ * A tabela databook_attachments será criada em uma futura fase quando
+ * o processamento automático de anexos de email for implementado.
+ *
+ * Campos planejados:
+ * - databook_id   → FK para databooks
+ * - email_log_id  → FK para email_import_logs (origem do anexo, se vier por email)
+ * - filename      → nome original do arquivo
+ * - content_type  → MIME type (application/pdf, image/dwg, etc.)
+ * - size_bytes    → tamanho em bytes
+ * - storage_path  → caminho no Supabase Storage
+ * - source        → 'email' | 'manual'
+ */
+export interface DatabookAttachment {
+  id: string;
+  databook_id: string;
+  email_log_id: string | null;
+  filename: string;
+  content_type: string | null;
+  size_bytes: number | null;
+  storage_path: string | null;
+  source: 'email' | 'manual';
+  created_at: string;
 }

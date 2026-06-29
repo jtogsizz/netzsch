@@ -152,3 +152,89 @@ CREATE POLICY "audit_logs_authenticated_read"
 
 -- Nenhum dado inicial.
 -- Os responsáveis serão cadastrados pelo próprio sistema.
+
+-- ============================================================
+-- Migration v2 — Email Inbound: Fila de Aprovação
+-- Executar APÓS o schema inicial caso a tabela já exista.
+-- ============================================================
+
+-- ---- Novas colunas em email_import_logs ----
+-- (idempotentes via ADD COLUMN IF NOT EXISTS)
+ALTER TABLE email_import_logs
+  ADD COLUMN IF NOT EXISTS from_name        TEXT,
+  ADD COLUMN IF NOT EXISTS to_address       TEXT,
+  ADD COLUMN IF NOT EXISTS raw_html         TEXT,
+  ADD COLUMN IF NOT EXISTS extracted_fields JSONB,
+  ADD COLUMN IF NOT EXISTS queue_status     TEXT NOT NULL DEFAULT 'pending'
+    CHECK (queue_status IN ('pending', 'approved', 'duplicate', 'blocked', 'error'));
+
+-- Índice para filtros de fila
+CREATE INDEX IF NOT EXISTS idx_email_logs_queue_status ON email_import_logs (queue_status);
+CREATE INDEX IF NOT EXISTS idx_email_logs_received_at  ON email_import_logs (received_at);
+
+-- Migrar registros existentes: mapear status legado para queue_status
+-- success   → approved  (já criou databook automaticamente)
+-- duplicate → duplicate
+-- blocked   → blocked
+-- error     → error
+-- (queue_status tem DEFAULT 'pending', então registros sem status legado ficam pending)
+UPDATE email_import_logs
+SET queue_status = CASE status
+  WHEN 'success'   THEN 'approved'
+  WHEN 'duplicate' THEN 'duplicate'
+  WHEN 'blocked'   THEN 'blocked'
+  WHEN 'error'     THEN 'error'
+  ELSE 'pending'
+END
+WHERE queue_status = 'pending';  -- só afeta registros ainda sem queue_status definido
+
+-- ---- RLS para email_import_logs ----
+ALTER TABLE email_import_logs ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "email_logs_authenticated_read"   ON email_import_logs;
+DROP POLICY IF EXISTS "email_logs_authenticated_delete" ON email_import_logs;
+DROP POLICY IF EXISTS "email_logs_authenticated_update" ON email_import_logs;
+
+-- Leitura: qualquer usuário autenticado pode ver os logs
+CREATE POLICY "email_logs_authenticated_read"
+  ON email_import_logs FOR SELECT
+  TO authenticated
+  USING (true);
+
+-- Exclusão: usuários autenticados podem remover registros de log
+CREATE POLICY "email_logs_authenticated_delete"
+  ON email_import_logs FOR DELETE
+  TO authenticated
+  USING (true);
+
+-- Atualização: usuários autenticados podem atualizar queue_status/databook_id (via approve)
+CREATE POLICY "email_logs_authenticated_update"
+  ON email_import_logs FOR UPDATE
+  TO authenticated
+  USING (true)
+  WITH CHECK (true);
+
+-- Inserção: service_role bypassa RLS automaticamente (webhook usa createServiceClient)
+-- Nenhuma policy de INSERT necessária para usuários autenticados.
+
+-- ============================================================
+-- Preparação para Anexos (fase futura — tabela NÃO criada agora)
+-- ============================================================
+--
+-- Quando implementado, executar:
+--
+-- CREATE TABLE IF NOT EXISTS databook_attachments (
+--   id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+--   databook_id     UUID NOT NULL REFERENCES databooks(id) ON DELETE CASCADE,
+--   email_log_id    UUID REFERENCES email_import_logs(id) ON DELETE SET NULL,
+--   filename        TEXT NOT NULL,
+--   content_type    TEXT,
+--   size_bytes      BIGINT,
+--   storage_path    TEXT,   -- caminho no Supabase Storage
+--   source          TEXT NOT NULL DEFAULT 'manual', -- 'email' | 'manual'
+--   created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+-- );
+-- CREATE INDEX IF NOT EXISTS idx_attachments_databook ON databook_attachments(databook_id);
+-- ALTER TABLE databook_attachments ENABLE ROW LEVEL SECURITY;
+-- (+ policies de RLS conforme padrão do projeto)
+

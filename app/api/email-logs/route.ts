@@ -11,16 +11,27 @@ export async function GET(request: Request) {
   }
 
   const { searchParams } = new URL(request.url);
+  // Filtro por queue_status (novo campo principal)
+  const queueStatus = searchParams.get('queue_status') ?? '';
+  // Filtro legado por status (mantido para compatibilidade)
   const status = searchParams.get('status') ?? '';
   const page = Math.max(1, parseInt(searchParams.get('page') ?? '1'));
   const page_size = Math.min(100, Math.max(10, parseInt(searchParams.get('page_size') ?? '25')));
 
-  let query = supabase
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let query = (supabase as any)
     .from('email_import_logs')
     .select('*', { count: 'exact' })
     .order('received_at', { ascending: false });
 
-  if (status) {
+  // Filtro por queue_status tem prioridade sobre status legado
+  if (queueStatus) {
+    const allowed = ['pending', 'approved', 'duplicate', 'blocked', 'error'];
+    if (allowed.includes(queueStatus)) {
+      query = query.eq('queue_status', queueStatus);
+    }
+  } else if (status) {
+    // Compatibilidade: filtro pelo status legado
     const allowed = ['success', 'duplicate', 'blocked', 'error'];
     if (allowed.includes(status)) {
       query = query.eq('status', status);

@@ -122,43 +122,6 @@ function resolveField(rawKey: string): string | null {
   return map[n] ?? null;
 }
 
-/** Normaliza valor de data para YYYY-MM-DD ou null */
-function parseDate(value: string): string | null {
-  if (!value) return null;
-  const trimmed = value.trim();
-  if (trimmed.includes('/')) {
-    const parts = trimmed.split('/');
-    if (parts.length === 3) {
-      const day = parts[0].padStart(2, '0');
-      const month = parts[1].padStart(2, '0');
-      let year = parts[2];
-      if (year.length === 2) year = `20${year}`;
-      const d = new Date(`${year}-${month}-${day}`);
-      if (!isNaN(d.getTime())) return `${year}-${month}-${day}`;
-    }
-  }
-  if (/^\d{4}-\d{2}-\d{2}/.test(trimmed)) return trimmed.slice(0, 10);
-  const parsed = new Date(trimmed);
-  if (!isNaN(parsed.getTime())) return parsed.toISOString().split('T')[0];
-  return null;
-}
-
-function parseStatus(value: string): 'Novo' | 'Em andamento' | 'Encerrado' {
-  const upper = value.toUpperCase();
-  if (upper.includes('ENCERRADO') || upper.includes('CLOSED') || upper.includes('DONE'))
-    return 'Encerrado';
-  if (upper.includes('ANDAMENTO') || upper.includes('PROCESSO') || upper.includes('PROGRESS'))
-    return 'Em andamento';
-  return 'Novo';
-}
-
-function parsePriority(value: string): 'Alta' | 'Normal' | 'Baixa' {
-  const upper = value.toUpperCase();
-  if (upper.includes('ALTA') || upper.includes('HIGH') || upper.includes('URGENTE')) return 'Alta';
-  if (upper.includes('BAIXA') || upper.includes('LOW')) return 'Baixa';
-  return 'Normal';
-}
-
 /**
  * Parser estruturado — opcional, para emails que contenham linhas "Campo: Valor".
  * O campo 'number' é ignorado aqui (já extraído por extractNumbers).
@@ -180,15 +143,23 @@ function parseStructuredFields(text: string): Record<string, string> {
 
 // ── Tipos internos ────────────────────────────────────────────────────────────
 
-type LogStatus = 'success' | 'duplicate' | 'blocked' | 'error';
+type LogQueueStatus = 'pending' | 'approved' | 'duplicate' | 'blocked' | 'error';
+type LogLegacyStatus = 'success' | 'duplicate' | 'blocked' | 'error';
 
 interface ImportLogEntry {
   from_address: string;
+  from_name: string | null;
+  to_address: string | null;
   subject: string;
   raw_body: string;
-  status: LogStatus;
-  error_message: string | null;
+  raw_html: string | null;
+  extracted_fields: Record<string, string> | null;
   databook_number: string | null;
+  /** status legado — mantido para compatibilidade */
+  status: LogLegacyStatus;
+  /** status da fila de aprovação — campo principal */
+  queue_status: LogQueueStatus;
+  error_message: string | null;
   databook_id: string | null;
 }
 
@@ -199,9 +170,14 @@ async function logImport(entry: ImportLogEntry): Promise<void> {
     const supabase = createServiceClient();
     await (supabase as any).from('email_import_logs').insert({
       from_address: entry.from_address,
+      from_name: entry.from_name,
+      to_address: entry.to_address,
       subject: entry.subject,
       raw_body: entry.raw_body.slice(0, 4000),
+      raw_html: entry.raw_html ? entry.raw_html.slice(0, 50000) : null,
+      extracted_fields: entry.extracted_fields,
       status: entry.status,
+      queue_status: entry.queue_status,
       error_message: entry.error_message,
       databook_number: entry.databook_number,
       databook_id: entry.databook_id,
@@ -223,8 +199,11 @@ async function logImport(entry: ImportLogEntry): Promise<void> {
  *   1. Valida INBOUND_EMAIL_SECRET no header Authorization
  *   2. Valida remetente na whitelist inbound_email_allowed_senders (active = true)
  *   3. Extrai número do assunto/corpo (5–8 dígitos)
- *   4. Verifica duplicata em databooks — opção A: não cria, registra 'duplicate'
- *   5. Cria databook com defaults + grava audit_log e email_import_log
+ *   4. Verifica duplicata em databooks
+ *   5. Grava log com queue_status = 'pending' — operador decide se cria o databook
+ *
+ * ATENÇÃO: O databook NÃO é criado automaticamente.
+ * O operador deve clicar "Adicionar ao Sistema" na tela de Log de Emails.
  *
  * Retorna sempre 200 para blocked/duplicate/error controlado
  * para que a Resend não reencaminhe o webhook como falha.
@@ -261,8 +240,19 @@ export async function POST(request: Request) {
   const rawFrom: string = payload?.from ?? '';
   const fromAddress = rawFrom.match(/<([^>]+)>/)?.[1]?.toLowerCase().trim()
     ?? rawFrom.toLowerCase().trim();
+
+  // Extrai o nome do remetente se presente (ex.: "João Gabriel <joao@gmail.com>" → "João Gabriel")
+  const fromNameRaw = rawFrom.match(/^([^<]+)<[^>]+>/)?.[1]?.trim() ?? null;
+  const fromName = fromNameRaw && fromNameRaw.length > 0 ? fromNameRaw : null;
+
+  // Destinatário
+  const rawTo: string = Array.isArray(payload?.to) ? payload.to[0] : (payload?.to ?? '');
+  const toAddress = rawTo.trim() || null;
+
   const subject: string = payload?.subject ?? '';
   const emailText = extractText(payload);
+  const emailHtml: string | null =
+    typeof payload?.html === 'string' && payload.html.trim() ? payload.html : null;
   const searchText = emailText || subject;
 
   // ── 3. Validação da whitelist ──────────────────────────────────────────────
@@ -278,9 +268,14 @@ export async function POST(request: Request) {
     console.error('[inbound-email] Erro ao consultar whitelist:', senderError);
     await logImport({
       from_address: fromAddress,
+      from_name: fromName,
+      to_address: toAddress,
       subject,
       raw_body: searchText,
+      raw_html: emailHtml,
+      extracted_fields: null,
       status: 'error',
+      queue_status: 'error',
       error_message: `Erro ao consultar whitelist: ${senderError.message}`,
       databook_number: null,
       databook_id: null,
@@ -296,9 +291,14 @@ export async function POST(request: Request) {
     console.warn(`[inbound-email] Bloqueado: ${fromAddress} — ${reason}`);
     await logImport({
       from_address: fromAddress,
+      from_name: fromName,
+      to_address: toAddress,
       subject,
       raw_body: searchText,
+      raw_html: emailHtml,
+      extracted_fields: null,
       status: 'blocked',
+      queue_status: 'blocked',
       error_message: reason,
       databook_number: null,
       databook_id: null,
@@ -313,14 +313,43 @@ export async function POST(request: Request) {
     emailText
   );
 
+  // ── 5. Parser estruturado (opcional) ──────────────────────────────────────
+  const structuredFields = parseStructuredFields(emailText);
+  const hasStructuredData = Object.keys(structuredFields).length > 0;
+
+  // Monta nota automática para uso futuro quando o operador aprovar
+  let notesValue = hasStructuredData && structuredFields['notes']
+    ? structuredFields['notes']
+    : 'Criado automaticamente por email. Completar dados manualmente.';
+
+  if (extraNumbers.length > 0) {
+    notesValue += ` | Outros números no email: ${extraNumbers.join(', ')}`;
+  }
+
+  // Salva campos estruturados no JSON para uso na aprovação posterior
+  const extractedFieldsForLog = databookNumber
+    ? {
+        ...structuredFields,
+        // Inclui o número e extras para referência
+        _number: databookNumber,
+        _extra_numbers: extraNumbers.join(','),
+        _notes: notesValue,
+      }
+    : (hasStructuredData ? { ...structuredFields, _notes: notesValue } : null);
+
   if (!databookNumber) {
     const msg = 'Nenhum número de databook (5–8 dígitos) encontrado no email';
     console.warn(`[inbound-email] ${msg}. From: ${fromAddress} | Subject: ${subject}`);
     await logImport({
       from_address: fromAddress,
+      from_name: fromName,
+      to_address: toAddress,
       subject,
       raw_body: searchText,
+      raw_html: emailHtml,
+      extracted_fields: extractedFieldsForLog,
       status: 'error',
+      queue_status: 'error',
       error_message: msg,
       databook_number: null,
       databook_id: null,
@@ -328,7 +357,7 @@ export async function POST(request: Request) {
     return NextResponse.json({ received: true, action: 'error', reason: msg });
   }
 
-  // ── 5. Verificar duplicata (opção A: não criar nem atualizar) ──────────────
+  // ── 6. Verificar duplicata ─────────────────────────────────────────────────
   const { data: existing, error: fetchError } = await (supabase as any)
     .from('databooks')
     .select('id, number')
@@ -339,9 +368,14 @@ export async function POST(request: Request) {
     console.error('[inbound-email] Erro ao buscar databook existente:', fetchError);
     await logImport({
       from_address: fromAddress,
+      from_name: fromName,
+      to_address: toAddress,
       subject,
       raw_body: searchText,
+      raw_html: emailHtml,
+      extracted_fields: extractedFieldsForLog,
       status: 'error',
+      queue_status: 'error',
       error_message: `Erro ao consultar banco: ${fetchError.message}`,
       databook_number: databookNumber,
       databook_id: null,
@@ -351,12 +385,17 @@ export async function POST(request: Request) {
 
   if (existing) {
     const msg = `Databook ${databookNumber} já existe no sistema`;
-    console.info(`[inbound-email] Duplicata ignorada: ${msg}`);
+    console.info(`[inbound-email] Duplicata detectada: ${msg}`);
     await logImport({
       from_address: fromAddress,
+      from_name: fromName,
+      to_address: toAddress,
       subject,
       raw_body: searchText,
+      raw_html: emailHtml,
+      extracted_fields: extractedFieldsForLog,
       status: 'duplicate',
+      queue_status: 'duplicate',
       error_message: msg,
       databook_number: databookNumber,
       databook_id: existing.id,
@@ -369,100 +408,38 @@ export async function POST(request: Request) {
     });
   }
 
-  // ── 6. Parser estruturado (opcional) ──────────────────────────────────────
-  const structuredFields = parseStructuredFields(emailText);
-  const hasStructuredData = Object.keys(structuredFields).length > 0;
-
-  // Nota automática
-  let notesValue = hasStructuredData && structuredFields['notes']
-    ? structuredFields['notes']
-    : 'Criado automaticamente por email. Completar dados manualmente.';
-
-  if (extraNumbers.length > 0) {
-    notesValue += ` | Outros números no email: ${extraNumbers.join(', ')}`;
-  }
-
-  // ── 7. Monta e insere o databook ───────────────────────────────────────────
-  const databookData = {
-    number: databookNumber,
-    client_name: structuredFields['client_name'] || null,
-    technical_status: structuredFields['technical_status'] || null,
-    company_name: structuredFields['company_name'] || null,
-    responsible_name: structuredFields['responsible_name'] || null,
-    general_status: structuredFields['general_status']
-      ? parseStatus(structuredFields['general_status'])
-      : 'Novo',
-    delivery_date: structuredFields['delivery_date']
-      ? parseDate(structuredFields['delivery_date'])
-      : null,
-    entry_date: structuredFields['entry_date']
-      ? parseDate(structuredFields['entry_date'])
-      : new Date().toISOString().split('T')[0],
-    priority: structuredFields['priority']
-      ? parsePriority(structuredFields['priority'])
-      : 'Normal',
-    type: structuredFields['type'] || 'Peças',
-    fiscal_year: structuredFields['fiscal_year'] || null,
-    notes: notesValue,
-    source: 'email',
-  };
-
-  const { data: created, error: insertError } = await (supabase as any)
-    .from('databooks')
-    .insert(databookData)
-    .select('id')
-    .single();
-
-  if (insertError) {
-    console.error('[inbound-email] Erro ao criar databook:', insertError);
-    await logImport({
-      from_address: fromAddress,
-      subject,
-      raw_body: searchText,
-      status: 'error',
-      error_message: `Erro ao criar databook: ${insertError.message}`,
-      databook_number: databookNumber,
-      databook_id: null,
-    });
-    return NextResponse.json({ received: true, action: 'error', reason: 'insert_failed' });
-  }
-
-  const databookId: string | null = created?.id ?? null;
-
-  // ── 8. Audit log ───────────────────────────────────────────────────────────
-  if (databookId) {
-    await (supabase as any).from('audit_logs').insert({
-      databook_id: databookId,
-      action: 'created',
-      field_name: null,
-      old_value: null,
-      new_value: databookNumber,
-      changed_by: `email:${fromAddress}`,
-    });
-  }
-
-  // ── 9. Log de importação ───────────────────────────────────────────────────
+  // ── 7. Gravar na fila de aprovação (pending) ───────────────────────────────
+  //
+  // O databook NÃO é criado aqui. O operador deve revisar o email na tela
+  // "Log de Emails" e clicar em "Adicionar ao Sistema" para criar o databook.
   await logImport({
     from_address: fromAddress,
+    from_name: fromName,
+    to_address: toAddress,
     subject,
     raw_body: searchText,
-    status: 'success',
+    raw_html: emailHtml,
+    extracted_fields: extractedFieldsForLog,
+    status: 'success',          // legado: 'success' indica email válido recebido
+    queue_status: 'pending',    // novo: aguarda aprovação do operador
     error_message: null,
     databook_number: databookNumber,
-    databook_id: databookId,
+    databook_id: null,           // será preenchido após aprovação
   });
 
   console.log(
-    `[inbound-email] Criado databook ${databookNumber} via email de ${fromAddress}` +
-    (senderRow.name ? ` (${senderRow.name})` : '') +
+    `[inbound-email] Email válido enfileirado (pending): DB ${databookNumber}` +
+    ` | De: ${fromAddress}` +
+    (fromName ? ` (${fromName})` : '') +
+    (senderRow.name ? ` / Whitelist: ${senderRow.name}` : '') +
     (extraNumbers.length ? ` | outros números: ${extraNumbers.join(', ')}` : '')
   );
 
   return NextResponse.json({
     received: true,
-    action: 'created',
+    action: 'queued',
+    queue_status: 'pending',
     databook_number: databookNumber,
-    databook_id: databookId,
     ...(extraNumbers.length > 0 && { other_numbers_found: extraNumbers }),
   });
 }
