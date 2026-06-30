@@ -155,11 +155,156 @@ O sistema valida o remetente, extrai o numero e cria o databook automaticamente.
 ### Como funciona
 
 1. Funcionario autorizado encaminha email para `databook@prenaarok.resend.app`
-2. A Resend recebe o email e dispara o webhook para `/api/inbound-email`
-3. O sistema valida o `INBOUND_EMAIL_SECRET` e a whitelist de remetentes
-4. O numero do databook e extraido do assunto ou corpo
-5. Se o numero ja existir: registra `duplicate`, nao altera o databook
-6. Se for novo: cria o databook com status `Novo` e source `email`
+2. A Resend recebe o email e dispara webhook para `/api/inbound-email` (com headers Svix)
+3. O sistema verifica a assinatura criptografica (`RESEND_WEBHOOK_SECRET`)
+4. O sistema chama `resend.emails.receiving.get(email_id)` para obter o corpo completo
+5. Valida o remetente na whitelist de remetentes autorizados
+6. Extrai o numero do databook do assunto/corpo
+7. Grava o email em `email_import_logs` com `queue_status = pending`
+8. O operador revisa em **Log de Emails** e clica **Adicionar ao Sistema** para criar o databook
+
+> O databook NAO e criado automaticamente. O operador aprova manualmente.
+
+---
+
+### Dois modos de operacao da rota
+
+A rota `/api/inbound-email` detecta automaticamente o modo pelo header recebido:
+
+| Header presente | Modo | Autenticacao |
+|---|---|---|
+| `svix-id` | Webhook real Resend (producao) | Assinatura Svix + `RESEND_WEBHOOK_SECRET` |
+| `Authorization: Bearer` | Teste manual (PowerShell/curl) | `INBOUND_EMAIL_SECRET` |
+
+---
+
+### Seguranca
+
+| Camada | Mecanismo |
+|--------|-----------|
+| Webhook real | Assinatura HMAC Svix (`RESEND_WEBHOOK_SECRET`) — impossivel de forjar |
+| Teste manual | `INBOUND_EMAIL_SECRET` no header `Authorization: Bearer` |
+| Whitelist | Tabela `inbound_email_allowed_senders` — apenas emails com `active = true` |
+| Deduplicacao | Numero ja existente → registra `duplicate`, nao cria databook |
+| Retorno 200 | blocked/duplicate/error retornam 200 para evitar reenvios da Resend |
+
+---
+
+### Configuracao do webhook na Resend
+
+1. Acesse **Resend Dashboard → Webhooks**
+2. Clique **Add Endpoint**
+3. Em **Endpoint URL**: `https://netzsch.vercel.app/api/inbound-email`
+4. Em **Events**: marque apenas `email.received`
+5. Salve e copie o **Signing Secret** (comeca com `whsec_`)
+6. Configure `RESEND_WEBHOOK_SECRET=whsec_...` na Vercel (ver abaixo)
+
+> **Importante:** Nao configure nenhum header customizado (Authorization) no webhook da Resend.
+> A autenticacao e feita exclusivamente via assinatura Svix automatica.
+
+---
+
+### Variaveis de ambiente necessarias
+
+```env
+# Resend — webhook real (producao)
+RESEND_WEBHOOK_SECRET=whsec_...    # Resend Dashboard → Webhooks → Signing Secret
+RESEND_API_KEY=re_...              # Resend Dashboard → API Keys
+
+# Teste manual (PowerShell/curl)
+INBOUND_EMAIL_SECRET=<token>       # gerar com: openssl rand -hex 32
+
+# Supabase (ja existentes)
+SUPABASE_SECRET_KEY=<service_role_key>
+```
+
+### Configuracao das variaveis na Vercel
+
+1. Acesse **Vercel Dashboard → seu projeto → Settings → Environment Variables**
+2. Adicione:
+   - `RESEND_WEBHOOK_SECRET` = valor do Signing Secret (whsec_...)
+   - `RESEND_API_KEY` = sua API key da Resend (re_...)
+3. Clique **Save** e faca **Redeploy** do projeto para aplicar
+
+---
+
+### Gerenciamento da whitelist
+
+Acesse no sistema:
+- **Sidebar → Email → Remetentes** (`/settings/senders`) — adicionar/editar/desativar
+- **Sidebar → Email → Logs de Email** (`/settings/email-logs`) — fila de aprovacao e auditoria
+
+---
+
+### Status dos logs
+
+| queue_status | Significado |
+|---|---|
+| `pending` | Email recebido, aguardando revisao do operador |
+| `approved` | Operador clicou "Adicionar ao Sistema" — databook criado |
+| `duplicate` | Numero ja existe no sistema — nenhuma acao necessaria |
+| `blocked` | Remetente nao autorizado |
+| `error` | Erro tecnico (sem numero no email, falha no banco, etc.) |
+
+---
+
+### Exemplos de emails aceitos
+
+```
+Assunto: Novo databook 500662
+Corpo:   Segue solicitação 500662 recebida por email.
+```
+
+```
+Assunto: HD 500662
+Corpo:   (qualquer texto ou vazio)
+```
+
+```
+Assunto: FW: Solicitação de peças
+Corpo:   Segue databook 500662 para providências.
+```
+
+O numero pode aparecer em qualquer parte do email — o parser detecta automaticamente qualquer sequencia de 5 a 8 digitos.
+
+---
+
+### Teste manual via PowerShell
+
+```powershell
+# Teste com remetente autorizado e numero novo
+Invoke-RestMethod `
+  -Uri "https://netzsch.vercel.app/api/inbound-email" `
+  -Method POST `
+  -Headers @{
+    "Authorization" = "Bearer SEU_INBOUND_EMAIL_SECRET"
+    "Content-Type"  = "application/json"
+  } `
+  -Body '{"from":"joao@empresa.com","to":"databook@prenaarok.resend.app","subject":"HD 500662","text":"Segue databook 500662"}'
+```
+
+Resposta esperada:
+```json
+{ "received": true, "action": "queued", "queue_status": "pending", "databook_number": "500662" }
+```
+
+### Teste manual via curl
+
+```bash
+curl -X POST https://netzsch.vercel.app/api/inbound-email \
+  -H "Authorization: Bearer SEU_INBOUND_EMAIL_SECRET" \
+  -H "Content-Type: application/json" \
+  -d '{"from":"joao@empresa.com","to":"databook@prenaarok.resend.app","subject":"HD 500662","text":"Segue databook 500662"}'
+```
+
+---
+
+### SQL Migration
+
+Execute o bloco de migration no **SQL Editor** do Supabase.
+O script completo esta em `supabase/schema.sql` (secao "Migration v2").
+
+
 
 ---
 

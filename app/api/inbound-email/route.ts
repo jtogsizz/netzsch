@@ -1,25 +1,23 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { NextResponse } from 'next/server';
+import { Resend } from 'resend';
 import { createServiceClient } from '@/lib/supabase/server';
 
 // Rota 100% server-side — sem cookies, sem sessão de usuário.
 // Usa SUPABASE_SECRET_KEY (service_role) via createServiceClient().
-// Segurança: INBOUND_EMAIL_SECRET + whitelist de remetentes autorizados.
+//
+// DOIS modos de operação:
+//  A) Webhook real da Resend  — autenticado via headers Svix (svix-id, svix-timestamp, svix-signature)
+//                               Payload: { type: "email.received", data: { email_id, from, to, subject, ... } }
+//                               Corpo do email buscado via resend.emails.receiving.get(email_id)
+//  B) Teste manual (PowerShell) — autenticado via Authorization: Bearer INBOUND_EMAIL_SECRET
+//                               Payload flat: { from, to, subject, text, html }
 export const runtime = 'nodejs';
 export const maxDuration = 30;
 
 // ── Regex de extração ─────────────────────────────────────────────────────────
 
-/**
- * Regex para números de databook válidos: 5 a 8 dígitos isolados.
- * (?<!\d) e (?!\d) garantem que não é parte de um número maior.
- */
 const NUMBER_PATTERN = '(?<!\\d)(\\d{5,8})(?!\\d)';
-
-/**
- * Palavras-chave que indicam que o número seguinte é o do databook.
- * Captura "Databook 500662", "HD 500662", "Solicitação 500662", "DB 500662".
- */
 const KEYWORD_PATTERN =
   '(?:databook|solicitac[aã]o|solicita[cç][aã]o|hd|db|n[uú]mero|num|pedido|os|ordem)' +
   '\\s*[:\\-–]?\\s*(\\d{5,8})(?!\\d)';
@@ -27,12 +25,10 @@ const KEYWORD_PATTERN =
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /** Extrai texto do corpo do email. Preferência: plain text; fallback: HTML strip. */
-function extractText(payload: any): string {
-  if (typeof payload?.text === 'string' && payload.text.trim()) {
-    return payload.text.trim();
-  }
-  if (typeof payload?.html === 'string' && payload.html.trim()) {
-    return payload.html
+function extractText(textBody: string | null, htmlBody: string | null): string {
+  if (textBody && textBody.trim()) return textBody.trim();
+  if (htmlBody && htmlBody.trim()) {
+    return htmlBody
       .replace(/<br\s*\/?>/gi, '\n')
       .replace(/<[^>]+>/g, '')
       .replace(/&nbsp;/gi, ' ')
@@ -45,21 +41,19 @@ function extractText(payload: any): string {
   return '';
 }
 
-/**
- * Extrai o número primário e números extras do assunto + corpo.
- *
- * Estratégia:
- * 1. Procura número PRECEDIDO de palavra-chave (alta confiança).
- * 2. Fallback: primeiro número de 5–8 dígitos em qualquer parte do texto.
- * 3. Extras = demais números encontrados (vão para notes).
- */
+/** Extrai texto do payload flat (compatibilidade com teste manual). */
+function extractTextFromPayload(payload: any): string {
+  return extractText(
+    typeof payload?.text === 'string' ? payload.text : null,
+    typeof payload?.html === 'string' ? payload.html : null,
+  );
+}
+
 function extractNumbers(
   subject: string,
   body: string
 ): { primary: string | null; extras: string[] } {
   const fullText = `${subject}\n${body}`;
-
-  // Passo 1: palavra-chave
   const keywordMatches: string[] = [];
   const kwRegex = new RegExp(KEYWORD_PATTERN, 'gi');
   let m: RegExpExecArray | null;
@@ -67,22 +61,17 @@ function extractNumbers(
     const num = m[1];
     if (!keywordMatches.includes(num)) keywordMatches.push(num);
   }
-
-  // Passo 2: todos os números válidos
   const allNumbers: string[] = [];
   const numRegex = new RegExp(NUMBER_PATTERN, 'g');
   while ((m = numRegex.exec(fullText)) !== null) {
     const num = m[1];
     if (!allNumbers.includes(num)) allNumbers.push(num);
   }
-
   const primary = keywordMatches[0] ?? allNumbers[0] ?? null;
   const extras = allNumbers.filter((n) => n !== primary);
-
   return { primary, extras };
 }
 
-/** Normaliza uma linha para extrair chave/valor separados por : */
 function parseLine(line: string): { key: string; value: string } | null {
   const idx = line.indexOf(':');
   if (idx < 0) return null;
@@ -92,16 +81,10 @@ function parseLine(line: string): { key: string; value: string } | null {
   return { key, value };
 }
 
-/** Normaliza texto removendo acentos e deixando lowercase sem caracteres especiais */
 function normalize(s: string): string {
-  return s
-    .toLowerCase()
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .replace(/[^a-z0-9]/g, '');
+  return s.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9]/g, '');
 }
 
-/** Mapeia alias de chave para nome canônico do campo */
 function resolveField(rawKey: string): string | null {
   const n = normalize(rawKey);
   const map: Record<string, string> = {
@@ -122,10 +105,6 @@ function resolveField(rawKey: string): string | null {
   return map[n] ?? null;
 }
 
-/**
- * Parser estruturado — opcional, para emails que contenham linhas "Campo: Valor".
- * O campo 'number' é ignorado aqui (já extraído por extractNumbers).
- */
 function parseStructuredFields(text: string): Record<string, string> {
   const fields: Record<string, string> = {};
   for (const line of text.split('\n')) {
@@ -139,6 +118,18 @@ function parseStructuredFields(text: string): Record<string, string> {
     }
   }
   return fields;
+}
+
+/** Normaliza campo "from": extrai endereço e nome. */
+function parseFrom(rawFrom: string): { fromAddress: string; fromName: string | null } {
+  const match = rawFrom.match(/^(.+?)\s*<([^>]+)>\s*$/);
+  if (match) {
+    return {
+      fromName: match[1].trim() || null,
+      fromAddress: match[2].toLowerCase().trim(),
+    };
+  }
+  return { fromName: null, fromAddress: rawFrom.toLowerCase().trim() };
 }
 
 // ── Tipos internos ────────────────────────────────────────────────────────────
@@ -155,9 +146,7 @@ interface ImportLogEntry {
   raw_html: string | null;
   extracted_fields: Record<string, string> | null;
   databook_number: string | null;
-  /** status legado — mantido para compatibilidade */
   status: LogLegacyStatus;
-  /** status da fila de aprovação — campo principal */
   queue_status: LogQueueStatus;
   error_message: string | null;
   databook_id: string | null;
@@ -187,77 +176,24 @@ async function logImport(entry: ImportLogEntry): Promise<void> {
   }
 }
 
-// ── Handler principal ─────────────────────────────────────────────────────────
+// ── Processamento comum ───────────────────────────────────────────────────────
 
 /**
- * POST /api/inbound-email
- *
- * Webhook chamado pela Resend quando um email chega em databook@prenaarok.resend.app.
- * Payload (Resend Inbound Webhook v1): { from, to, subject, text, html, headers, ... }
- *
- * Fluxo de segurança:
- *   1. Valida INBOUND_EMAIL_SECRET no header Authorization
- *   2. Valida remetente na whitelist inbound_email_allowed_senders (active = true)
- *   3. Extrai número do assunto/corpo (5–8 dígitos)
- *   4. Verifica duplicata em databooks
- *   5. Grava log com queue_status = 'pending' — operador decide se cria o databook
- *
- * ATENÇÃO: O databook NÃO é criado automaticamente.
- * O operador deve clicar "Adicionar ao Sistema" na tela de Log de Emails.
- *
- * Retorna sempre 200 para blocked/duplicate/error controlado
- * para que a Resend não reencaminhe o webhook como falha.
+ * Processa os dados do email após autenticação.
+ * Compartilhado entre o modo webhook real (Resend) e o modo teste manual.
  */
-export async function POST(request: Request) {
-  // ── 1. Autenticação via secret ─────────────────────────────────────────────
-  const authHeader = request.headers.get('authorization') ?? '';
-  const secret = process.env.INBOUND_EMAIL_SECRET;
-
-  if (!secret) {
-    console.error('[inbound-email] INBOUND_EMAIL_SECRET não configurado');
-    return NextResponse.json({ error: 'Configuração ausente no servidor' }, { status: 500 });
-  }
-
-  const providedToken = authHeader.startsWith('Bearer ')
-    ? authHeader.slice(7).trim()
-    : authHeader.trim();
-
-  if (providedToken !== secret) {
-    console.warn('[inbound-email] Token inválido recebido');
-    // 401 aqui é OK — token errado indica requisição maliciosa, não Resend
-    return NextResponse.json({ error: 'Não autorizado' }, { status: 401 });
-  }
-
-  // ── 2. Parse do payload ────────────────────────────────────────────────────
-  let payload: any;
-  try {
-    payload = await request.json();
-  } catch {
-    return NextResponse.json({ error: 'Payload JSON inválido' }, { status: 400 });
-  }
-
-  // Normaliza o endereço do remetente (pode vir como "Nome <email>" ou só "email")
-  const rawFrom: string = payload?.from ?? '';
-  const fromAddress = rawFrom.match(/<([^>]+)>/)?.[1]?.toLowerCase().trim()
-    ?? rawFrom.toLowerCase().trim();
-
-  // Extrai o nome do remetente se presente (ex.: "João Gabriel <joao@gmail.com>" → "João Gabriel")
-  const fromNameRaw = rawFrom.match(/^([^<]+)<[^>]+>/)?.[1]?.trim() ?? null;
-  const fromName = fromNameRaw && fromNameRaw.length > 0 ? fromNameRaw : null;
-
-  // Destinatário
-  const rawTo: string = Array.isArray(payload?.to) ? payload.to[0] : (payload?.to ?? '');
-  const toAddress = rawTo.trim() || null;
-
-  const subject: string = payload?.subject ?? '';
-  const emailText = extractText(payload);
-  const emailHtml: string | null =
-    typeof payload?.html === 'string' && payload.html.trim() ? payload.html : null;
+async function processEmail(
+  fromAddress: string,
+  fromName: string | null,
+  toAddress: string | null,
+  subject: string,
+  emailText: string,
+  emailHtml: string | null,
+): Promise<NextResponse> {
+  const supabase = createServiceClient();
   const searchText = emailText || subject;
 
-  // ── 3. Validação da whitelist ──────────────────────────────────────────────
-  const supabase = createServiceClient();
-
+  // ── Validação da whitelist ─────────────────────────────────────────────────
   const { data: senderRow, error: senderError } = await (supabase as any)
     .from('inbound_email_allowed_senders')
     .select('id, email, name, active')
@@ -267,20 +203,12 @@ export async function POST(request: Request) {
   if (senderError) {
     console.error('[inbound-email] Erro ao consultar whitelist:', senderError);
     await logImport({
-      from_address: fromAddress,
-      from_name: fromName,
-      to_address: toAddress,
-      subject,
-      raw_body: searchText,
-      raw_html: emailHtml,
-      extracted_fields: null,
-      status: 'error',
-      queue_status: 'error',
+      from_address: fromAddress, from_name: fromName, to_address: toAddress,
+      subject, raw_body: searchText, raw_html: emailHtml,
+      extracted_fields: null, status: 'error', queue_status: 'error',
       error_message: `Erro ao consultar whitelist: ${senderError.message}`,
-      databook_number: null,
-      databook_id: null,
+      databook_number: null, databook_id: null,
     });
-    // Retorna 200 para não causar reenvio pela Resend
     return NextResponse.json({ received: true, action: 'error', reason: 'whitelist_query_failed' });
   }
 
@@ -290,95 +218,56 @@ export async function POST(request: Request) {
       : 'Remetente desativado na whitelist';
     console.warn(`[inbound-email] Bloqueado: ${fromAddress} — ${reason}`);
     await logImport({
-      from_address: fromAddress,
-      from_name: fromName,
-      to_address: toAddress,
-      subject,
-      raw_body: searchText,
-      raw_html: emailHtml,
-      extracted_fields: null,
-      status: 'blocked',
-      queue_status: 'blocked',
-      error_message: reason,
-      databook_number: null,
-      databook_id: null,
+      from_address: fromAddress, from_name: fromName, to_address: toAddress,
+      subject, raw_body: searchText, raw_html: emailHtml,
+      extracted_fields: null, status: 'blocked', queue_status: 'blocked',
+      error_message: reason, databook_number: null, databook_id: null,
     });
-    // 200 para não causar reenvio pela Resend
     return NextResponse.json({ received: true, action: 'blocked', reason });
   }
 
-  // ── 4. Extração do número ──────────────────────────────────────────────────
-  const { primary: databookNumber, extras: extraNumbers } = extractNumbers(
-    subject,
-    emailText
-  );
+  // ── Extração do número ─────────────────────────────────────────────────────
+  const { primary: databookNumber, extras: extraNumbers } = extractNumbers(subject, emailText);
 
-  // ── 5. Parser estruturado (opcional) ──────────────────────────────────────
+  // ── Parser estruturado ─────────────────────────────────────────────────────
   const structuredFields = parseStructuredFields(emailText);
   const hasStructuredData = Object.keys(structuredFields).length > 0;
 
-  // Monta nota automática para uso futuro quando o operador aprovar
   let notesValue = hasStructuredData && structuredFields['notes']
     ? structuredFields['notes']
     : 'Criado automaticamente por email. Completar dados manualmente.';
-
   if (extraNumbers.length > 0) {
     notesValue += ` | Outros números no email: ${extraNumbers.join(', ')}`;
   }
 
-  // Salva campos estruturados no JSON para uso na aprovação posterior
   const extractedFieldsForLog = databookNumber
-    ? {
-        ...structuredFields,
-        // Inclui o número e extras para referência
-        _number: databookNumber,
-        _extra_numbers: extraNumbers.join(','),
-        _notes: notesValue,
-      }
+    ? { ...structuredFields, _number: databookNumber, _extra_numbers: extraNumbers.join(','), _notes: notesValue }
     : (hasStructuredData ? { ...structuredFields, _notes: notesValue } : null);
 
   if (!databookNumber) {
     const msg = 'Nenhum número de databook (5–8 dígitos) encontrado no email';
     console.warn(`[inbound-email] ${msg}. From: ${fromAddress} | Subject: ${subject}`);
     await logImport({
-      from_address: fromAddress,
-      from_name: fromName,
-      to_address: toAddress,
-      subject,
-      raw_body: searchText,
-      raw_html: emailHtml,
-      extracted_fields: extractedFieldsForLog,
-      status: 'error',
-      queue_status: 'error',
-      error_message: msg,
-      databook_number: null,
-      databook_id: null,
+      from_address: fromAddress, from_name: fromName, to_address: toAddress,
+      subject, raw_body: searchText, raw_html: emailHtml,
+      extracted_fields: extractedFieldsForLog, status: 'error', queue_status: 'error',
+      error_message: msg, databook_number: null, databook_id: null,
     });
     return NextResponse.json({ received: true, action: 'error', reason: msg });
   }
 
-  // ── 6. Verificar duplicata ─────────────────────────────────────────────────
+  // ── Verificar duplicata ────────────────────────────────────────────────────
   const { data: existing, error: fetchError } = await (supabase as any)
-    .from('databooks')
-    .select('id, number')
-    .eq('number', databookNumber)
-    .maybeSingle();
+    .from('databooks').select('id, number').eq('number', databookNumber).maybeSingle();
 
   if (fetchError) {
     console.error('[inbound-email] Erro ao buscar databook existente:', fetchError);
     await logImport({
-      from_address: fromAddress,
-      from_name: fromName,
-      to_address: toAddress,
-      subject,
-      raw_body: searchText,
-      raw_html: emailHtml,
-      extracted_fields: extractedFieldsForLog,
-      status: 'error',
-      queue_status: 'error',
+      from_address: fromAddress, from_name: fromName, to_address: toAddress,
+      subject, raw_body: searchText, raw_html: emailHtml,
+      extracted_fields: extractedFieldsForLog, status: 'error', queue_status: 'error',
       error_message: `Erro ao consultar banco: ${fetchError.message}`,
-      databook_number: databookNumber,
-      databook_id: null,
+      databook_number: databookNumber, databook_id: null,
     });
     return NextResponse.json({ received: true, action: 'error', reason: 'db_query_failed' });
   }
@@ -387,48 +276,29 @@ export async function POST(request: Request) {
     const msg = `Databook ${databookNumber} já existe no sistema`;
     console.info(`[inbound-email] Duplicata detectada: ${msg}`);
     await logImport({
-      from_address: fromAddress,
-      from_name: fromName,
-      to_address: toAddress,
-      subject,
-      raw_body: searchText,
-      raw_html: emailHtml,
-      extracted_fields: extractedFieldsForLog,
-      status: 'duplicate',
-      queue_status: 'duplicate',
-      error_message: msg,
-      databook_number: databookNumber,
-      databook_id: existing.id,
+      from_address: fromAddress, from_name: fromName, to_address: toAddress,
+      subject, raw_body: searchText, raw_html: emailHtml,
+      extracted_fields: extractedFieldsForLog, status: 'duplicate', queue_status: 'duplicate',
+      error_message: msg, databook_number: databookNumber, databook_id: existing.id,
     });
-    return NextResponse.json({
-      received: true,
-      action: 'duplicate',
-      databook_number: databookNumber,
-      databook_id: existing.id,
-    });
+    return NextResponse.json({ received: true, action: 'duplicate', databook_number: databookNumber, databook_id: existing.id });
   }
 
-  // ── 7. Gravar na fila de aprovação (pending) ───────────────────────────────
+  // ── Gravar na fila de aprovação (pending) ──────────────────────────────────
   //
-  // O databook NÃO é criado aqui. O operador deve revisar o email na tela
-  // "Log de Emails" e clicar em "Adicionar ao Sistema" para criar o databook.
+  // O databook NÃO é criado aqui. O operador deve revisar em "Log de Emails"
+  // e clicar em "Adicionar ao Sistema" para criar o databook.
   await logImport({
-    from_address: fromAddress,
-    from_name: fromName,
-    to_address: toAddress,
-    subject,
-    raw_body: searchText,
-    raw_html: emailHtml,
+    from_address: fromAddress, from_name: fromName, to_address: toAddress,
+    subject, raw_body: searchText, raw_html: emailHtml,
     extracted_fields: extractedFieldsForLog,
-    status: 'success',          // legado: 'success' indica email válido recebido
-    queue_status: 'pending',    // novo: aguarda aprovação do operador
-    error_message: null,
-    databook_number: databookNumber,
-    databook_id: null,           // será preenchido após aprovação
+    status: 'success',       // legado: email válido recebido
+    queue_status: 'pending', // novo: aguarda aprovação do operador
+    error_message: null, databook_number: databookNumber, databook_id: null,
   });
 
   console.log(
-    `[inbound-email] Email válido enfileirado (pending): DB ${databookNumber}` +
+    `[inbound-email] Email enfileirado (pending): DB ${databookNumber}` +
     ` | De: ${fromAddress}` +
     (fromName ? ` (${fromName})` : '') +
     (senderRow.name ? ` / Whitelist: ${senderRow.name}` : '') +
@@ -442,4 +312,183 @@ export async function POST(request: Request) {
     databook_number: databookNumber,
     ...(extraNumbers.length > 0 && { other_numbers_found: extraNumbers }),
   });
+}
+
+// ── Handler principal ─────────────────────────────────────────────────────────
+
+/**
+ * POST /api/inbound-email
+ *
+ * Detecta automaticamente o modo de operação pelo header recebido:
+ *
+ * MODO A — Webhook real da Resend (produção):
+ *   Identifica pela presença de `svix-id` no header.
+ *   Autentica via assinatura criptográfica Svix usando RESEND_WEBHOOK_SECRET.
+ *   Payload: { type: "email.received", data: { email_id, from, to[], subject, attachments[] } }
+ *   Corpo completo (text/html) buscado via resend.emails.receiving.get(email_id).
+ *
+ * MODO B — Teste manual (PowerShell/curl):
+ *   Identifica pela presença de `Authorization: Bearer` no header.
+ *   Autentica via INBOUND_EMAIL_SECRET.
+ *   Payload flat: { from, to, subject, text, html }
+ *
+ * Em ambos os casos, o fluxo final é idêntico:
+ *   → validação whitelist → extração de número → log com queue_status=pending
+ *   O databook NÃO é criado automaticamente.
+ */
+export async function POST(request: Request) {
+  const svixId = request.headers.get('svix-id');
+  const authHeader = request.headers.get('authorization') ?? '';
+
+  // ── MODO A: Webhook real da Resend ─────────────────────────────────────────
+  if (svixId) {
+    return handleResendWebhook(request);
+  }
+
+  // ── MODO B: Teste manual ───────────────────────────────────────────────────
+  if (authHeader) {
+    return handleManualTest(request, authHeader);
+  }
+
+  // Nenhum dos modos reconhecidos
+  console.warn('[inbound-email] Requisição sem svix-id nem Authorization — rejeitada');
+  return NextResponse.json({ error: 'Não autorizado' }, { status: 401 });
+}
+
+// ── MODO A: Webhook real da Resend ────────────────────────────────────────────
+
+async function handleResendWebhook(request: Request): Promise<NextResponse> {
+  const webhookSecret = process.env.RESEND_WEBHOOK_SECRET;
+  const apiKey = process.env.RESEND_API_KEY;
+
+  if (!webhookSecret) {
+    console.error('[inbound-email] RESEND_WEBHOOK_SECRET não configurado');
+    // Retorna 200 para evitar reenvio pela Resend enquanto variável não está configurada
+    return NextResponse.json({ received: true, action: 'error', reason: 'webhook_secret_missing' });
+  }
+
+  // ── Leitura do body raw (obrigatório para verificação da assinatura) ────────
+  const rawBody = await request.text();
+
+  // ── Verificação da assinatura Svix ─────────────────────────────────────────
+  let payload: any;
+  try {
+    const resend = new Resend(apiKey ?? 'placeholder');
+    payload = resend.webhooks.verify({
+      payload: rawBody,
+      headers: {
+        id:        request.headers.get('svix-id') ?? '',
+        timestamp: request.headers.get('svix-timestamp') ?? '',
+        signature: request.headers.get('svix-signature') ?? '',
+      },
+      webhookSecret,
+    });
+  } catch (err) {
+    console.warn('[inbound-email] Assinatura Svix inválida:', err);
+    // 400 é o correto aqui — assinatura inválida = requisição maliciosa
+    return NextResponse.json({ error: 'Assinatura inválida' }, { status: 400 });
+  }
+
+  // ── Verificar tipo do evento ────────────────────────────────────────────────
+  if (payload?.type !== 'email.received') {
+    // Outros tipos de evento da Resend (email.sent, email.bounced, etc.) — ignorar
+    console.info(`[inbound-email] Evento ignorado: ${payload?.type}`);
+    return NextResponse.json({ received: true, action: 'ignored', type: payload?.type });
+  }
+
+  const data = payload?.data ?? {};
+  const emailId: string = data?.email_id ?? '';
+
+  if (!emailId) {
+    console.error('[inbound-email] email_id ausente no payload Resend');
+    return NextResponse.json({ received: true, action: 'error', reason: 'email_id_missing' });
+  }
+
+  // ── Parse de metadados do payload ──────────────────────────────────────────
+  const rawFrom: string = data?.from ?? '';
+  const { fromAddress, fromName } = parseFrom(rawFrom);
+
+  const toRaw = data?.to;
+  const toAddress: string | null = Array.isArray(toRaw)
+    ? (toRaw[0] ?? null)
+    : (typeof toRaw === 'string' ? toRaw : null);
+
+  const subject: string = data?.subject ?? '';
+
+  // ── Buscar corpo completo via API Resend ────────────────────────────────────
+  let emailText = '';
+  let emailHtml: string | null = null;
+
+  if (!apiKey) {
+    console.warn('[inbound-email] RESEND_API_KEY não configurado — corpo do email não recuperado');
+  } else {
+    try {
+      const resend = new Resend(apiKey);
+      const { data: emailData, error: emailError } = await resend.emails.receiving.get(emailId);
+      if (emailError) {
+        console.error('[inbound-email] Erro ao buscar corpo do email:', emailError);
+      } else if (emailData) {
+        emailText = extractText(
+          (emailData as any).text ?? null,
+          (emailData as any).html ?? null,
+        );
+        emailHtml = typeof (emailData as any).html === 'string' ? (emailData as any).html : null;
+      }
+    } catch (err) {
+      console.error('[inbound-email] Exceção ao buscar corpo do email:', err);
+    }
+  }
+
+  console.log(
+    `[inbound-email] Webhook real recebido: from=${fromAddress} | subject=${subject} | email_id=${emailId}`
+  );
+
+  return processEmail(fromAddress, fromName, toAddress, subject, emailText, emailHtml);
+}
+
+// ── MODO B: Teste manual (PowerShell/curl) ────────────────────────────────────
+
+async function handleManualTest(request: Request, authHeader: string): Promise<NextResponse> {
+  const secret = process.env.INBOUND_EMAIL_SECRET;
+
+  if (!secret) {
+    console.error('[inbound-email] INBOUND_EMAIL_SECRET não configurado');
+    return NextResponse.json({ error: 'Configuração ausente no servidor' }, { status: 500 });
+  }
+
+  const providedToken = authHeader.startsWith('Bearer ')
+    ? authHeader.slice(7).trim()
+    : authHeader.trim();
+
+  if (providedToken !== secret) {
+    console.warn('[inbound-email] Token manual inválido');
+    return NextResponse.json({ error: 'Não autorizado' }, { status: 401 });
+  }
+
+  let payload: any;
+  try {
+    payload = await request.json();
+  } catch {
+    return NextResponse.json({ error: 'Payload JSON inválido' }, { status: 400 });
+  }
+
+  // Suporta tanto payload flat quanto envelope Resend (para testes mais realistas)
+  const data = payload?.type === 'email.received' ? (payload?.data ?? {}) : payload;
+
+  const rawFrom: string = data?.from ?? '';
+  const { fromAddress, fromName } = parseFrom(rawFrom);
+
+  const toRaw = data?.to;
+  const toAddress: string | null = Array.isArray(toRaw)
+    ? (toRaw[0] ?? null)
+    : (typeof toRaw === 'string' ? toRaw : null);
+
+  const subject: string = data?.subject ?? '';
+  const emailText = extractTextFromPayload(data);
+  const emailHtml: string | null =
+    typeof data?.html === 'string' && data.html.trim() ? data.html : null;
+
+  console.log(`[inbound-email] Teste manual: from=${fromAddress} | subject=${subject}`);
+
+  return processEmail(fromAddress, fromName, toAddress, subject, emailText, emailHtml);
 }
